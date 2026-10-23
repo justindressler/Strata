@@ -30,6 +30,7 @@ while [ $# -gt 0 ]; do
     --calib) CALIB=$2; shift 2 ;;
     --labels) LABELS=$2; shift 2 ;;
     --pipe-cap) PIPE_CAP=1; shift ;;   # arm P phase 1: capture rows inside the pipelined read
+    --no-pin) NO_PIN=1; shift ;;       # A/B the state-parking path against the fully unpinned read
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -46,6 +47,7 @@ case "${LABELS:-upper}" in
   *) echo "labels must be upper|digit-lower (got '$LABELS')" >&2; exit 2 ;;
 esac
 [ -n "$PIPE_CAP" ] && EXTRA+=("STRATA_JEV_PIPE_CAP=1")
+[ -n "${NO_PIN:-}" ] && EXTRA+=("STRATA_JEV_PIN=0")
 
 python3 - "$CONFIG" "$ARM" "${EXTRA[@]:-}" <<'PY'
 import re, sys
