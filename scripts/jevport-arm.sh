@@ -24,10 +24,12 @@ ARM=${1:-c}
 shift || true
 CALIB=""
 LABELS=""
+PIPE_CAP=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --calib) CALIB=$2; shift 2 ;;
     --labels) LABELS=$2; shift 2 ;;
+    --pipe-cap) PIPE_CAP=1; shift ;;   # arm P phase 1: capture rows inside the pipelined read
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -43,6 +45,7 @@ case "${LABELS:-upper}" in
   digit-lower) EXTRA+=("STRATA_JEV_LABELS=digit-lower") ;;
   *) echo "labels must be upper|digit-lower (got '$LABELS')" >&2; exit 2 ;;
 esac
+[ -n "$PIPE_CAP" ] && EXTRA+=("STRATA_JEV_PIPE_CAP=1")
 
 python3 - "$CONFIG" "$ARM" "${EXTRA[@]:-}" <<'PY'
 import re, sys
@@ -130,9 +133,9 @@ KEY="$KEY" python3 eval_mf_set.py run --base "$BASE/upstream/$PRESET" --key "$KE
 echo "--- live env on the serve process:"
 LIVE_ALL=$($DOCKER exec llama-swap sh -c 'for p in /proc/[0-9]*; do
   e=$(tr "\0" "\n" < $p/environ 2>/dev/null || true)
-  case "$e" in *STRATA_JEV_MODES*) echo "$e" | grep -E "^STRATA_JEV_(ROWS|HYBRID|LABELS)=" ;; esac
+  case "$e" in *STRATA_JEV_MODES*) echo "$e" | grep -E "^STRATA_JEV_(ROWS|HYBRID|LABELS|PIPE_CAP)=" ;; esac
 done' 2>/dev/null || true)
-LIVE=$(echo "$LIVE_ALL" | grep -E "^STRATA_JEV_(ROWS|HYBRID)=" || true)   # arm flags only
+LIVE=$(echo "$LIVE_ALL" | grep -E "^STRATA_JEV_(ROWS|HYBRID|PIPE_CAP)=" || true)   # arm flags only
 LIVE_LABELS=$(echo "$LIVE_ALL" | grep -E "^STRATA_JEV_LABELS=" || true)   # label flag only: the arm filter above
 # dropped LABELS, so asking for digit-lower always ended in a false "MISMATCH" after setting it correctly
 echo "  ${LIVE_ALL:-<no arm/label flags>}"
@@ -145,4 +148,11 @@ case "${LABELS:-upper}" in
   digit-lower) echo "$LIVE_LABELS" | grep -q 'LABELS=digit-lower' || { echo "MISMATCH: asked for digit-lower labels, live has: $LIVE_LABELS" >&2; exit 1; } ;;
   upper) echo "$LIVE_LABELS" | grep -q 'LABELS' && { echo "MISMATCH: asked for upper labels, live has: $LIVE_LABELS" >&2; exit 1; } ;;
 esac
-echo "arm $ARM labels=${LABELS:-upper} confirmed live"
+# The pipeline-capture flag is orthogonal to the arm, and the trap it prevents is the same one the arm
+# filter exists for: a stale env var would make the probe measure the OLD path and call it a result.
+if [ -n "$PIPE_CAP" ]; then
+  echo "$LIVE" | grep -q 'PIPE_CAP=1' || { echo "MISMATCH: asked for --pipe-cap, live has: $LIVE" >&2; exit 1; }
+else
+  echo "$LIVE" | grep -q 'PIPE_CAP' && { echo "MISMATCH: --pipe-cap not asked for, live has it: $LIVE" >&2; exit 1; }
+fi
+echo "arm $ARM labels=${LABELS:-upper} pipe_cap=${PIPE_CAP:-0} confirmed live"
