@@ -311,6 +311,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(jevpos_test PRIVATE include)
   add_test(NAME jevpos_test COMMAND jevpos_test)
 
+  # the P gate: pipelined prompt read + jev row capture together (Arm P, M3.5).  Header-only, no GPU.
+  add_executable(jevpipe_test tests/program/jevpipe_test.cpp)
+  target_include_directories(jevpipe_test PRIVATE include)
+  add_test(NAME jevpipe_test COMMAND jevpipe_test)
+
   # the prompt planner's host-memory model (#2824): header-only, no GPU
   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
   target_include_directories(prefill_plan_test PRIVATE include)

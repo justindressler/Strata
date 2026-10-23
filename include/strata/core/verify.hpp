@@ -190,6 +190,10 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// P (M3.5): the two parity verifiers run alternate windows and each keeps its OWN head rows, but a read
+    /// arrives on parity 0's chain.  A peer (the last stage's other parity) makes those rows visible to that
+    /// read.  Only the read side peers; capture always happens on the verifier that ran the window.
+    void set_capture_peer(Verifier* peer) { cap_peer_ = peer; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -348,7 +352,10 @@ public:
     void set_row_capture(const int64_t* positions, int n);
     bool capture_window_rows(int64_t pos0, int T, std::string& err);
     bool brow_row_captured(int64_t pos, const int32_t* tokens, int n, float* out, std::string& err);
-    int captured_rows() const { return next_ ? next_->captured_rows() : (int) cap_pos_.size(); }
+    int captured_rows() const {
+        if (next_ != nullptr) return next_->captured_rows();
+        return (int) cap_pos_.size() + (cap_peer_ != nullptr ? cap_peer_->captured_rows() : 0);
+    }
     void clear_row_capture();
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
@@ -651,6 +658,7 @@ private:
     std::vector<int64_t> cap_want_;   ///< jev --jev-brow fix B: absolute prompt positions whose rows to keep
     std::vector<int64_t> cap_pos_;    ///< ...and the ones actually captured, in capture order
     std::vector<float> cap_rows_;     ///< row i is cap_rows_[i * n_vocab_ .. (i+1) * n_vocab_)
+    Verifier* cap_peer_ = nullptr;    ///< P: the other parity's last-stage verifier, for reads only
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself

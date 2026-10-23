@@ -76,6 +76,7 @@
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/jevpos.hpp"
+#include "strata/program/jevpipe.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
@@ -13097,6 +13098,10 @@ int main(int argc, char** argv) {
             auto read_windows_pl = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 strata::core::progress_at("reading the prompt (pipelined verify windows), from token", a);
                 if (!pl_prepare(e)) return false;
+                // P: capture the named rows in the window that ran them.  pl_launch never captures by design, so
+                // a window's head rows exist only until the next same-parity launch overwrites them; this is the
+                // one place that runs between pl_finish and that launch.
+                const bool cap_rows = strata::program::pipe_capture_enabled() && !req_jevpos.empty();
                 for (int par = 0; par < 2; ++par) PV[0][par]->set_head_sampling(false);   // reaches stage 1 (set_next)
                 struct Restore {
                     strata::core::Verifier* v[2];
@@ -13157,6 +13162,8 @@ int main(int argc, char** argv) {
                             if (!v.pl_finish(nullptr, e)) return fail(e);
                             if (nonfinite_hit(v, "prompt")) return fail("non-finite logits (#879)");
                             const Win& w = wins[f1];
+                            // P: keep the rows this window ran, before the next same-parity launch overwrites them
+                            if (cap_rows && !v.capture_window_rows(w.q, w.T, e)) return fail(e);
                             for (int t = 0; t < w.T; ++t) nx[(size_t) t] = (int32_t) cur[(size_t) (w.q + t + 1)];
                             if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
                             {
@@ -13183,8 +13190,13 @@ int main(int argc, char** argv) {
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
                 // the pipelined prompt read stays two-stage (three or more stages read serially; only the decode overlaps)
-                if (pipe && n_stages == 2 && pl_pw >= 1 && req_jevpos.empty() &&
-                    std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
+                // P (M3.5): a request that named rows (`jevpos=`) used to be forced onto the serial loop, which is why
+                // arm B paid ~2.6x per prompt token.  With STRATA_JEV_PIPE_CAP=1 it keeps the pipelined read and the
+                // rows are captured inside it.  The rule itself is header-only and unit-tested (jevpipe.hpp).
+                const strata::program::PipeReadAsk ask{pipe, n_stages, pl_pw, !req_jevpos.empty(),
+                                                       std::getenv("STRATA_LOGPOS") != nullptr,
+                                                       strata::program::pipe_capture_enabled()};
+                if (strata::program::pipe_read_allowed(ask)) return read_windows_pl(a, b, e);
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
@@ -14065,6 +14077,15 @@ int main(int argc, char** argv) {
                 return std::max(a0, n - mt);
             };
             ver.set_row_capture(req_jevpos.empty() ? nullptr : req_jevpos.data(), (int) req_jevpos.size());
+            // P: the pipelined read alternates parity, and each parity verifier keeps its OWN head rows.  A read
+            // arrives on parity 0's chain, so without this every odd window's rows would be captured and then be
+            // unreachable - the BROWAT would refuse and the server would fall back, silently and correctly.
+            if (strata::program::pipe_capture_enabled() && n_stages >= 2 && !req_jevpos.empty()) {
+                strata::core::Verifier& last0 = stage_ver_p(n_stages - 1, 0);
+                strata::core::Verifier& last1 = stage_ver_p(n_stages - 1, 1);
+                last1.set_row_capture(req_jevpos.data(), (int) req_jevpos.size());
+                last0.set_capture_peer(&last1);
+            }
             if (std::getenv("STRATA_JEVROWS_TRACE") != nullptr)
                 std::fprintf(stderr, "strata serve: JEVROWS trace: n=%lld read_from=%lld jevpos=%zu cuts=%zu "
                                      "first=%lld last=%lld\n", (long long) n, (long long) read_from,
