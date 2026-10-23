@@ -757,7 +757,11 @@ def handle(svc, req: dict, mode: str = "L") -> tuple[int, dict]:
         if (_clean_enabled() and 1 < len(qdefs) <= MAX_NAMED_ROWS and not v_mode and not image_state
                 and _row_capture(engine) and hasattr(engine, "row_logits_at")
                 and hasattr(engine, "captured_rows")):
-            ordered = sorted(qdefs, key=lambda q: q["id"])
+            # The CALLER's order, not a canonical one: every field's prompt is independent here, so the order
+            # must not matter - and if it does, that is the bug to find, not something to paper over by
+            # re-rendering.  Arm C sends the caller's order too, so this is the only arrangement in which
+            # "identical answers" means anything.
+            ordered = list(qdefs)
             plan = clean_plan(svc, state_text, ordered)
             if plan is None:
                 print("[jev-clean] falling back to one prompt per field: no shared prefix to read once", flush=True)
