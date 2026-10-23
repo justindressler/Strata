@@ -616,51 +616,6 @@ def _row_capture(engine) -> bool:
     return getattr(engine, "info", {}).get("jevpos") == 1
 
 
-def _clean_enabled() -> bool:
-    """P-clean (opt-in): ONE request carries the shared prefix and every field's own suffix, and the engine
-    rewinds to the prefix between fields, so no field's cue is visible to another.  Its whole reason to exist
-    is that the cost is per REQUEST, not per token: measured 2026-10-23 on the 3090, a 66-token request and an
-    85-token request both take ~205 ms, so arm C's five fields pay four admissions they could share."""
-    import os
-    return os.environ.get("STRATA_JEV_CLEAN", "0") not in ("0", "false", "False", "off", "")
-
-
-def clean_plan(svc, state_text: str, qdefs: list):
-    """The P-clean request: (ids, rows, pin, lens), or None when the split cannot be exact.
-
-    Every field keeps its own prompt - field i's prompt is byte-for-byte what arm C sends for it - so the
-    answers are the ones C gives.  What differs is the wire: the shared prefix appears ONCE and the suffixes
-    follow it, and the engine reads each suffix from the prefix state.  `lens` and `rows` are positions in the
-    ids array the engine will see.  Refused (None) when there is no shared prefix to read once or a field has
-    no suffix of its own; never guessed, because a split one token out reads a neighbour's row.
-    """
-    prompts = []
-    for qdef in qdefs:
-        prompt = svc.template.render(
-            [{"role": "system", "content": SYSTEM_V1},
-             {"role": "user", "content": state_text + "\n\n" + question_block(qdef)}],
-            add_generation_prompt=True, enable_thinking=False)
-        ids = svc.tok.encode(prompt, parse_special=True)
-        if not ids:
-            return None
-        prompts.append(ids)
-    shortest = min(len(p) for p in prompts)
-    pin = 0
-    while pin < shortest and len({p[pin] for p in prompts}) == 1:
-        pin += 1
-    if pin < 1:
-        return None                                 # no shared prefix: not this shape
-    lens = [len(p) - pin for p in prompts]
-    if any(l < 1 for l in lens):
-        return None                                 # a field with no suffix of its own
-    ids = list(prompts[0][:pin])
-    rows = []
-    for l, p in zip(lens, prompts):
-        rows.append(len(ids) + l - 1)               # this field's LAST token, absolute
-        ids.extend(p[pin:])
-    return ids, rows, pin, lens
-
-
 def _captured_count(engine):
     """How many head rows the last request actually kept, or None when the engine cannot say."""
     fn = getattr(engine, "captured_rows", None)
@@ -750,44 +705,6 @@ def handle(svc, req: dict, mode: str = "L") -> tuple[int, dict]:
     if len(l_qdefs) > 1 and not image_state and _pin_enabled():
         l_pin = _shared_prefix_len(svc, [state_text + "\n\n" + question_block(q) for q in l_qdefs])
     with svc.fifo:                                       # the engine turn: one request at a time
-        # P-clean (opt-in): ONE request carries the shared prefix and every field's own suffix; the engine reads
-        # each suffix from the prefix state, so the fields stay independent AND only one admission is paid.
-        # Every field's prompt is byte-identical to arm C's, so the answers must be C's - any difference is the
-        # rewind leaking, and the callers falls back rather than serve it.
-        if (_clean_enabled() and 1 < len(qdefs) <= MAX_NAMED_ROWS and not v_mode and not image_state
-                and _row_capture(engine) and hasattr(engine, "row_logits_at")
-                and hasattr(engine, "captured_rows")):
-            # The CALLER's order, not a canonical one: every field's prompt is independent here, so the order
-            # must not matter - and if it does, that is the bug to find, not something to paper over by
-            # re-rendering.  Arm C sends the caller's order too, so this is the only arrangement in which
-            # "identical answers" means anything.
-            ordered = list(qdefs)
-            plan = clean_plan(svc, state_text, ordered)
-            if plan is None:
-                print("[jev-clean] falling back to one prompt per field: no shared prefix to read once", flush=True)
-            else:
-                c_ids, c_rows, c_pin, c_lens = plan
-                cancel = threading.Event()
-                # NO strata_checkpoint:False here: the engine rewinds the fields through the checkpoint the
-                # pin marks, and ckpt=0 keeps none (`pin ignored: ckpt=0 keeps no checkpoint`).
-                for _ in engine.generate(c_ids, 1, {"pin": c_pin, "jevfields": c_lens, "jevpos": c_rows}, cancel):
-                    pass
-                if not _captured(engine, len(c_rows)):
-                    print(f"[jev-clean] falling back to one prompt per field: the engine kept "
-                          f"{_captured_count(engine)} rows for {len(c_rows)} named positions", flush=True)
-                else:
-                    out = {}
-                    for qdef, row_at in zip(ordered, c_rows):
-                        variants = [svc.tok.encode(lbl, parse_special=True)[:1]
-                                    for lbl in qdef["render_labels"]]
-                        tokens = sorted({t for v in variants for t in v})
-                        try:
-                            scores = readout_scores(engine.row_logits_at(row_at, tokens), variants)
-                        except ValueError as e:
-                            return _err("state", f"logits readout failed: {e}")
-                        out[qdef["id"]] = _finish_answer(qdef, scores, image_state)
-                    return 200, {"answers": out,
-                                 "usage": {"prompt_tokens": len(c_ids), "readout_tokens": len(qdefs)}}
         # M3.1 fix B (jevpos, opt-in): text L-mode with more than one field - ONE prompt read, one head row
         # kept per field, instead of one prompt per field.  Falls back to the per-question path whenever the
         # engine cannot serve it (no jevpos, a template whose seam moves, a tokenizer that merges).

@@ -76,8 +76,6 @@
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/jevpos.hpp"
-#include "strata/program/jevpipe.hpp"
-#include "strata/program/jevfields.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
@@ -12295,7 +12293,6 @@ int main(int argc, char** argv) {
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
-            std::string req_jevfields_text;   // P-clean: the raw `jevfields=` list, validated once n and pin are known
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
@@ -12320,9 +12317,6 @@ int main(int argc, char** argv) {
                         // position, and never a truncated list - jev.py compares the count it named against
                         // captured_rows(), so a shorter list would be caught there but a DUPLICATED one would not.
                         strata::program::jevpos::parse(tok.substr(eq + 1), req_jevpos);
-                    }
-                    else if (key == "jevfields") {   // P-clean: per-field suffix lengths, validated below
-                        req_jevfields_text = tok.substr(eq + 1);
                     }
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -12373,17 +12367,6 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
-            // P-clean: validate the field split now that the prompt length and the pin are known.  Anything
-            // doubtful leaves the split EMPTY, which means "not a P-clean request" - the request is served the
-            // ordinary way.  A split that does not add up would read one field's cue at another field's row and
-            // answer a neighbour's question while looking correct, so it is refused, never repaired.
-            strata::program::FieldSplit req_fields;
-            if (!req_jevfields_text.empty()) {
-                std::string why;
-                if (!strata::program::parse_jevfields(req_jevfields_text.c_str(), n, (int64_t) req_pin, req_fields, why))
-                    std::fprintf(stderr, "strata serve: jevfields=%s ignored: %s (this request reads as one prompt)\n",
-                                 req_jevfields_text.c_str(), why.c_str());
-            }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -13114,10 +13097,6 @@ int main(int argc, char** argv) {
             auto read_windows_pl = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 strata::core::progress_at("reading the prompt (pipelined verify windows), from token", a);
                 if (!pl_prepare(e)) return false;
-                // P: capture the named rows in the window that ran them.  pl_launch never captures by design, so
-                // a window's head rows exist only until the next same-parity launch overwrites them; this is the
-                // one place that runs between pl_finish and that launch.
-                const bool cap_rows = strata::program::pipe_capture_enabled() && !req_jevpos.empty();
                 for (int par = 0; par < 2; ++par) PV[0][par]->set_head_sampling(false);   // reaches stage 1 (set_next)
                 struct Restore {
                     strata::core::Verifier* v[2];
@@ -13178,8 +13157,6 @@ int main(int argc, char** argv) {
                             if (!v.pl_finish(nullptr, e)) return fail(e);
                             if (nonfinite_hit(v, "prompt")) return fail("non-finite logits (#879)");
                             const Win& w = wins[f1];
-                            // P: keep the rows this window ran, before the next same-parity launch overwrites them
-                            if (cap_rows && !v.capture_window_rows(w.q, w.T, e)) return fail(e);
                             for (int t = 0; t < w.T; ++t) nx[(size_t) t] = (int32_t) cur[(size_t) (w.q + t + 1)];
                             if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
                             {
@@ -13206,13 +13183,8 @@ int main(int argc, char** argv) {
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
                 // the pipelined prompt read stays two-stage (three or more stages read serially; only the decode overlaps)
-                // P (M3.5): a request that named rows (`jevpos=`) used to be forced onto the serial loop, which is why
-                // arm B paid ~2.6x per prompt token.  With STRATA_JEV_PIPE_CAP=1 it keeps the pipelined read and the
-                // rows are captured inside it.  The rule itself is header-only and unit-tested (jevpipe.hpp).
-                const strata::program::PipeReadAsk ask{pipe, n_stages, pl_pw, !req_jevpos.empty(),
-                                                       std::getenv("STRATA_LOGPOS") != nullptr,
-                                                       strata::program::pipe_capture_enabled()};
-                if (strata::program::pipe_read_allowed(ask)) return read_windows_pl(a, b, e);
+                if (pipe && n_stages == 2 && pl_pw >= 1 && req_jevpos.empty() &&
+                    std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
@@ -14064,11 +14036,6 @@ int main(int argc, char** argv) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
-            // P-clean: the prompt read stops at the pinned prefix, not at n - 1.  Each field's suffix is read
-            // from that state separately (the loop after this one), so the linear read must not walk into the
-            // first field's cue - that is what would let one field see another.
-            if (req_fields.lens.size() > 1 && pin_at > 0)
-                cuts.erase(std::remove(cuts.begin(), cuts.end(), n - 1), cuts.end());
             int64_t at = read_from;
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
@@ -14098,15 +14065,6 @@ int main(int argc, char** argv) {
                 return std::max(a0, n - mt);
             };
             ver.set_row_capture(req_jevpos.empty() ? nullptr : req_jevpos.data(), (int) req_jevpos.size());
-            // P: the pipelined read alternates parity, and each parity verifier keeps its OWN head rows.  A read
-            // arrives on parity 0's chain, so without this every odd window's rows would be captured and then be
-            // unreachable - the BROWAT would refuse and the server would fall back, silently and correctly.
-            if (strata::program::pipe_capture_enabled() && n_stages >= 2 && !req_jevpos.empty()) {
-                strata::core::Verifier& last0 = stage_ver_p(n_stages - 1, 0);
-                strata::core::Verifier& last1 = stage_ver_p(n_stages - 1, 1);
-                last1.set_row_capture(req_jevpos.data(), (int) req_jevpos.size());
-                last0.set_capture_peer(&last1);
-            }
             if (std::getenv("STRATA_JEVROWS_TRACE") != nullptr)
                 std::fprintf(stderr, "strata serve: JEVROWS trace: n=%lld read_from=%lld jevpos=%zu cuts=%zu "
                                      "first=%lld last=%lld\n", (long long) n, (long long) read_from,
@@ -14185,39 +14143,6 @@ int main(int argc, char** argv) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
-            // ---- P-clean (jevfields=): N independent field suffixes over the prefix just read --------------
-            // The prefix read stopped at the pin (the cuts above).  Each field then starts from exactly that
-            // state - the checkpoint at the pin carries GDN, PLE and the indexer's tail, block_pos and last
-            // pooled row (conversation_state.cpp:187-210) - so no field's cue is visible to any other and only
-            // ONE admission is paid for all of them.  The last field stops one token short: the decode phase
-            // below produces that token (p = n - 1), so its row comes from the same place every row does.
-            if (req_fields.lens.size() > 1 && pin_at > 0 && !cancelled) {
-                const ConvCheckpoint* pck = nullptr;
-                for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() == pin_at) pck = &c;
-                if (pck == nullptr) {
-                    std::fprintf(stderr, "strata serve: jevfields: the pinned prefix (%lld tokens) has no checkpoint, "
-                                         "so the fields cannot be rewound - refused\n", (long long) pin_at);
-                    std::printf("ERR jevfields: no checkpoint at the pinned prefix\n");
-                    return 1;
-                }
-                for (size_t fi = 0; fi < req_fields.lens.size(); ++fi) {
-                    const int64_t start = req_fields.start((int) fi);
-                    const int64_t end = fi + 1 == req_fields.lens.size() ? n - 1 : start + req_fields.lens[fi];
-                    if (!checkpoint_restore(*pck, ss, g)) {
-                        std::printf("ERR jevfields: rewinding to the pinned prefix failed\n");
-                        return 1;
-                    }
-                    if (end > start && !read_windows(start, end, err)) {
-                        std::printf("ERR jevfields: reading field %zu failed: %s\n", fi + 1, err.c_str());
-                        return 1;
-                    }
-                    pp_reached = end;
-                }
-                if (trace)
-                    std::fprintf(stderr, "strata serve: jevfields: %zu fields read, each from the pinned prefix\n",
-                                 req_fields.lens.size());
-            }
             if (o.prefill_head_alias) {
                 sp.reset();
                 const auto head_t0 = Clock::now();
@@ -14274,15 +14199,7 @@ int main(int argc, char** argv) {
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
-            // P-clean: the session holds the prefix and the LAST field's suffix, not the whole ids array -
-            // reporting the linear prompt here would tell the next request that this one consumed tokens that
-            // were rewound away.
-            if (req_fields.lens.size() > 1 && pin_at > 0) {
-                for (int64_t i = 0; i < pin_at; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
-                for (int64_t i = req_fields.start((int) req_fields.lens.size() - 1); i < p; ++i)
-                    consumed.push_back((int32_t) ids[(size_t) i]);
-            } else
-                for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)

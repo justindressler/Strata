@@ -3244,9 +3244,6 @@ void Verifier::set_row_capture(const int64_t* positions, int n) {
     cap_want_.assign(positions, positions + n);
     std::sort(cap_want_.begin(), cap_want_.end());
     cap_want_.erase(std::unique(cap_want_.begin(), cap_want_.end()), cap_want_.end());
-    // P: both parities run windows, so both must want the same rows - or half of them are captured and
-    // unreachable.  The peer seals the read side; this seals the capture side.
-    if (cap_peer_ != nullptr) cap_peer_->set_row_capture(cap_want_.data(), (int) cap_want_.size());
 }
 
 void Verifier::clear_row_capture() {
@@ -3254,7 +3251,6 @@ void Verifier::clear_row_capture() {
     cap_want_.clear();
     cap_pos_.clear();
     cap_rows_.clear();
-    if (cap_peer_ != nullptr) cap_peer_->clear_row_capture();
 }
 
 bool Verifier::capture_window_rows(int64_t pos0, int T, std::string& err) {
@@ -3290,8 +3286,6 @@ bool Verifier::brow_row_captured(int64_t pos, const int32_t* tokens, int n, floa
     if (next_ != nullptr) return next_->brow_row_captured(pos, tokens, n, out, err);
     const auto it = std::find(cap_pos_.begin(), cap_pos_.end(), pos);
     if (it == cap_pos_.end()) {
-        // P: the window that ran this position may have been the other parity's.
-        if (cap_peer_ != nullptr) return cap_peer_->brow_row_captured(pos, tokens, n, out, err);
         // Never a neighbouring row: answering position 61 with row 62 is the bug this whole op exists to
         // avoid, and it would look fast and correct.
         err = "brow_row_at: prompt position " + std::to_string(pos) +
