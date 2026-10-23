@@ -862,5 +862,75 @@ class ChoiceLabelScheme(unittest.TestCase):
         self.assertEqual(qdefs[1]["render_labels"], ["0", "1", "2"])
 
 
+class CleanBatch(unittest.TestCase):
+    """P-clean (opt-in): ONE request carries the shared prefix and every field's own suffix.
+
+    What these tests prove is the CONTRACT: one generate instead of N, the wire carries the pin, the
+    per-field suffix lengths and one row position per field, the lengths add up to the prompt past the prefix,
+    and the answers are arm C's - because each field's prompt is byte-identical to C's, so any difference
+    would be the engine's rewind leaking rather than a different computation.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine, cls.httpd, cls.base = start_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        self._old = _os.environ.get("STRATA_JEV_CLEAN")
+        _os.environ["STRATA_JEV_CLEAN"] = "1"
+        self.engine.prompts.clear()
+        self.engine.pins.clear()
+        self.engine.capture_ok = True
+
+    def tearDown(self):
+        if self._old is None:
+            _os.environ.pop("STRATA_JEV_CLEAN", None)
+        else:
+            _os.environ["STRATA_JEV_CLEAN"] = self._old
+
+    THREE = StatePin.THREE
+
+    def _post(self, questions):
+        return post(self.base, "/v1/systemone", {"state": {"hp": 7}, "questions": questions})
+
+    def test_one_request_carries_the_prefix_and_every_suffix(self):
+        st, body = self._post(self.THREE)
+        self.assertEqual(st, 200)
+        self.assertEqual(len(self.engine.prompts), 1, "one admission, not one per field")
+        keys = self.engine.pins[-1]
+        self.assertGreater(keys["pin"], 0)
+        self.assertEqual(len(keys["jevfields"]), 3)
+        self.assertEqual(len(keys["jevpos"]), 3)
+        self.assertEqual(sum(keys["jevfields"]), len(self.engine.prompts[0]) - keys["pin"],
+                         "the suffix lengths must add up to the prompt past the prefix")
+        # each row is the LAST token of its field's suffix, in order, and strictly increasing
+        pos, base = [], keys["pin"]
+        for l in keys["jevfields"]:
+            pos.append(base + l - 1)
+            base += l
+        self.assertEqual(keys["jevpos"], pos)
+        self.assertEqual(sorted(set(body["answers"])), ["q1", "q2", "q3"])
+
+    def test_answers_match_one_prompt_per_field(self):
+        _, on = self._post(self.THREE)
+        _os.environ["STRATA_JEV_CLEAN"] = "0"
+        _, off = self._post(self.THREE)
+        self.assertEqual(on["answers"], off["answers"],
+                         "P-clean is the same computation, so a different answer is the rewind leaking")
+        self.assertEqual(len(self.engine.prompts), 4, "three fields the ordinary way, after the clean run")
+
+    def test_falls_back_when_the_engine_keeps_no_rows(self):
+        self.engine.capture_ok = False
+        st, body = self._post(self.THREE)
+        self.assertEqual(st, 200)
+        self.assertEqual(len(self.engine.prompts), 4, "one clean attempt, then one prompt per field")
+        self.assertEqual(sorted(body["answers"]), ["q1", "q2", "q3"])
+
+
 if __name__ == "__main__":
     unittest.main()
