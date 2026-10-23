@@ -316,6 +316,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(jevpipe_test PRIVATE include)
   add_test(NAME jevpipe_test COMMAND jevpipe_test)
 
+  # P-clean's wire contract: the per-field suffix split.  Header-only, no GPU - and fail-closed, because a
+  # split that does not add up reads a neighbour's row.
+  add_executable(jevfields_test tests/program/jevfields_test.cpp)
+  target_include_directories(jevfields_test PRIVATE include)
+  add_test(NAME jevfields_test COMMAND jevfields_test)
+
   # the prompt planner's host-memory model (#2824): header-only, no GPU
   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
   target_include_directories(prefill_plan_test PRIVATE include)
