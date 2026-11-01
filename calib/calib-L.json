@@ -1,8 +1,8 @@
 {
   "tuple": "qfn-iq3_xxs|jev-port|none|v1|L|text",
-  "a_noul": 0.6127,
-  "c_noul": 0.6539,
+  "a_noul": 1.0,
+  "c_noul": 0.0,
   "T_choice": 1.0557,
   "T_score": 2.263,
-  "provenance": "fit 2026-10-15 suites2 text dev (BoolQ60/ARC60/SST5-60), corrected top-label harness"
+  "provenance": "identity by default - the noul intercept/slope this file used to ship (a=0.6127, c=+0.6539) were fitted on BoolQ60/ARC60/SST5-60 and cost 9.6 accuracy points when applied to another text task (500 items, p<0.001). The fit is preserved as calib-L-boolq-arc-sst5.json; T_choice/T_score are left untouched because their effect was not measured."
 }

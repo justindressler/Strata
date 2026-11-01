@@ -54,8 +54,13 @@ differing:
 Three rules follow, and they are the whole point of this document:
 
 1. **Doing nothing beat what shipped** (+9.6 points). A cross-task fit is worse than no fit.
-   That is why the loader now fails closed: a fit whose recorded task does not match the
-   runtime task is not applied, and the response says `"calib": "identity"`.
+   The loader therefore fails closed *when a runtime task tag is set*: a fit whose recorded task
+   does not match is not applied and the response says `"calib": "identity"`. With no
+   `STRATA_JEV_TASK` the loader keeps legacy behaviour (apply whatever loads), so the shipped
+   `calib-L.json` is now **identity** — the harmful cross-task fit survives only as
+   `calib-L-boolq-arc-sst5.json`, which carries `"task": "boolq-arc-sst5"` and is therefore
+   refused as soon as a deployment sets a tag. `T_choice`/`T_score` were left exactly as shipped:
+   their effect on accuracy was not measured, and a review patch should not guess.
 2. **The intercept is the decision lever.** Intercept-only ties full Platt on accuracy;
    the slope only buys Brier/ECE. A handful of labels gets you the decision win.
 3. **It is cheap.** Held-out accuracy by dev-set size: 25 items → 0.824, 50 → 0.824,

@@ -156,5 +156,32 @@ class TaskScopedCalibration(unittest.TestCase):
         self.assertIn("task", jev_calib._KNOWN_KEYS)
 
 
+    # ── 8. the SHIPPED default must be identity, not a stranger's fit ──────
+    def test_shipped_calib_L_is_identity(self):
+        """Regression guard for the defect this file exists to document.
+
+        calib/calib-L.json used to ship a=0.6127, c=+0.6539 - a fit from BoolQ60/ARC60/SST5-60 that
+        is applied to EVERY text task when STRATA_JEV_TASK is unset (legacy behaviour).  Applied to
+        a 500-item banking77 set it moved the yes-rate from 67.6% to 80.4% and cost 9.6 accuracy
+        points (p<0.001).  The default must be identity; the old fit lives in a task-tagged file the
+        guard refuses.
+        """
+        import json as _json
+        import pathlib as _pathlib
+        here = _pathlib.Path(__file__).resolve().parent.parent / "calib"
+        shipped = _json.loads((here / "calib-L.json").read_text())
+        self.assertEqual(shipped["a_noul"], 1.0,
+                         "the shipped default must not carry a cross-task slope")
+        self.assertEqual(shipped["c_noul"], 0.0,
+                         "the shipped default must not carry a cross-task intercept")
+        # the historical fit survives, but only tagged - so task_mismatch() refuses it
+        arch = _json.loads((here / "calib-L-boolq-arc-sst5.json").read_text())
+        self.assertEqual(arch["task"], "boolq-arc-sst5")
+        c = jev_calib.Calib(a_noul=arch["a_noul"], c_noul=arch["c_noul"], task=arch["task"])
+        c.loaded = True
+        self.assertNotEqual(jev_calib.task_mismatch(c, "banking77"), "",
+                            "a tagged historical fit must be refused for another task")
+
+
 if __name__ == "__main__":
     unittest.main()
