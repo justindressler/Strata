@@ -156,50 +156,55 @@ class TaskScopedCalibration(unittest.TestCase):
         self.assertIn("task", jev_calib._KNOWN_KEYS)
 
 
-    # ── 8. the SHIPPED default must be identity, not a stranger's fit ──────
-    def test_shipped_calib_L_is_identity(self):
-        """Regression guard for the defect this file exists to document.
+    # ── 8. nothing ships: a fresh checkout must serve identity ─────────────
+    def test_no_calibrator_files_ship(self):
+        """The default must be identity, and that must be true because nothing ships - not because a
+        shipped file happens to be harmless.
 
-        calib/calib-L.json used to ship a=0.6127, c=+0.6539 - a fit from BoolQ60/ARC60/SST5-60 that
-        is applied to EVERY text task when STRATA_JEV_TASK is unset (legacy behaviour).  Applied to
-        a 500-item banking77 set it moved the yes-rate from 67.6% to 80.4% and cost 9.6 accuracy
-        points (p<0.001).  The default must be identity; the old fit lives in a task-tagged file the
-        guard refuses.
+        calib/ used to carry calib-L/D/S.json.  calib-L cost 9.6 accuracy points on any text task but
+        its own (0.760 -> 0.664, p<0.001) because its Platt offset is a decision threshold for someone
+        else's prior; calib-S declared "a"/"c" which the loader never reads, so it was inert while its
+        T_choice was honoured.  Both classes of defect disappear when the parameters are the
+        deployer's to fit: ship the procedure (calib/README.md, scripts/refit_calib.py,
+        scripts/calib_precondition.py, scripts/check_calib.py), never the parameters.
         """
-        import json as _json
         import pathlib as _pathlib
         here = _pathlib.Path(__file__).resolve().parent.parent / "calib"
-        shipped = _json.loads((here / "calib-L.json").read_text())
-        self.assertEqual(shipped["a_noul"], 1.0,
-                         "the shipped default must not carry a cross-task slope")
-        self.assertEqual(shipped["c_noul"], 0.0,
-                         "the shipped default must not carry a cross-task intercept")
-        # the historical fit survives, but only tagged - so task_mismatch() refuses it
-        arch = _json.loads((here / "calib-L-boolq-arc-sst5.json").read_text())
-        self.assertEqual(arch["task"], "boolq-arc-sst5")
-        c = jev_calib.Calib(a_noul=arch["a_noul"], c_noul=arch["c_noul"], task=arch["task"])
-        c.loaded = True
-        self.assertNotEqual(jev_calib.task_mismatch(c, "banking77"), "",
-                            "a tagged historical fit must be refused for another task")
+        shipped = sorted(p.name for p in here.glob("calib-*.json"))
+        self.assertEqual(shipped, [],
+                         f"calibrator files must not ship ({shipped}); the default is identity and a "
+                         f"fit belongs to the deployment that measured it")
+        self.assertTrue((here / "README.md").is_file(),
+                        "calib/README.md is the deliverable that replaces the shipped fits")
 
+    def test_missing_calibrator_yields_identity_and_says_so(self):
+        """A deployment with no fit must get identity, a loaded=False handle, and calib id 'identity'."""
+        import pathlib as _pathlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            missing = _pathlib.Path(d) / "calib-L.json"
+            c = jev_calib.load(missing)
+            self.assertFalse(c.loaded)
+            self.assertEqual((c.a_noul, c.c_noul), (1.0, 0.0))
+            jev_calib._set_for_test(c, "L")
+            pr, cid = jev_calib.apply("noul", [0.30, 0.70], mode="L")
+            self.assertEqual(cid, "identity")
+            self.assertEqual(pr, [0.30, 0.70])
+            self._restore()
 
-    # ── 9. no shipped fit may declare a key the loader drops ───────────────
-    def test_no_shipped_fit_declares_unread_keys(self):
-        """calib-S.json shipped \"a\"/\"c\" - keys the loader never reads - so its noul fit was silently
-        identity while T_choice/T_score were honoured: a half-fitted calibrator. STRICT mode refuses
-        that shape, but STRICT is opt-in, so the shape must not ship at all.
-        """
+    # ── 9. the validator must still have teeth on a file that IS supplied ──
+    def test_legacy_keys_are_still_refused_under_strict(self):
+        """With nothing shipping, the half-fit trap can only arrive from a user-supplied file - so the
+        guard has to keep working against a temp file, not against a fixture that no longer exists."""
         import json as _json
         import pathlib as _pathlib
-        here = _pathlib.Path(__file__).resolve().parent.parent / "calib"
-        for f in sorted(here.glob("calib-*.json")):
-            j = _json.loads(f.read_text())
-            unknown = set(j) - jev_calib._KNOWN_KEYS
-            self.assertEqual(unknown, set(),
-                             f"{f.name} declares {sorted(unknown)}, which the loader silently drops")
-            for legacy in ("a", "c"):
-                self.assertNotIn(legacy, j, f"{f.name} uses the legacy {legacy!r} key (loader wants "
-                                            f"a_noul/c_noul) - the fit would not be applied")
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = _pathlib.Path(d) / "calib-L.json"
+            p.write_text(_json.dumps({"tuple": "t|t|t|v1|L|text", "a": 0.4892, "c": 0.8313}))
+            why = jev_calib._strict_problem(_json.loads(p.read_text()))
+            self.assertIn("not read by the loader", why,
+                          "the a/c vs a_noul/c_noul trap must still be detected")
 
 
 if __name__ == "__main__":

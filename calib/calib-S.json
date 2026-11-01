@@ -1,8 +1,0 @@
-{
- "tuple": "qfn-iq3_xxs|jev-port|none|v1|S|image-summary",
- "T_choice": 0.05,
- "T_score": 1.8702,
- "provenance": "noul = identity: this file shipped a/c, which the loader does not read (it expects a_noul/c_noul), so the noul fit (a=0.4892, c=+0.8313) was never applied - the declared values now match what actually runs. T_choice/T_score are unchanged and ARE applied; note T_choice=0.05 sits at the degenerate edge that STRATA_JEV_CALIB_STRICT refuses, so strict mode cannot be made the default until that temperature is refitted.",
- "a_noul": 1.0,
- "c_noul": 0.0
-}

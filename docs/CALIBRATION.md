@@ -54,13 +54,15 @@ differing:
 Three rules follow, and they are the whole point of this document:
 
 1. **Doing nothing beat what shipped** (+9.6 points). A cross-task fit is worse than no fit.
-   The loader therefore fails closed *when a runtime task tag is set*: a fit whose recorded task
-   does not match is not applied and the response says `"calib": "identity"`. With no
-   `STRATA_JEV_TASK` the loader keeps legacy behaviour (apply whatever loads), so the shipped
-   `calib-L.json` is now **identity** — the harmful cross-task fit survives only as
-   `calib-L-boolq-arc-sst5.json`, which carries `"task": "boolq-arc-sst5"` and is therefore
-   refused as soon as a deployment sets a tag. `T_choice`/`T_score` were left exactly as shipped:
-   their effect on accuracy was not measured, and a review patch should not guess.
+   **No calibrator files ship in this repository at all** — the default is identity, and
+   `calib/README.md` documents how to fit one against your own labelled items. The loader fails
+   closed *when a runtime task tag is set*: a fit whose recorded task does not match is not applied
+   and the response says `"calib": "identity"`. With no `STRATA_JEV_TASK` it keeps legacy behaviour
+   (apply whatever loads), which is precisely why nothing ships: a fit is a claim about one
+   distribution, and whoever deploys it should be the one making that claim. Use
+   `scripts/calib_precondition.py` first (it usually says IDENTITY), then
+   `scripts/refit_calib.py fit` (dev/holdout + gate), then `scripts/check_calib.py` to prove the
+   file is honoured rather than silently dropped.
 2. **The intercept is the decision lever.** Intercept-only ties full Platt on accuracy;
    the slope only buys Brier/ECE. A handful of labels gets you the decision win.
 3. **It is cheap.** Held-out accuracy by dev-set size: 25 items → 0.824, 50 → 0.824,

@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/opt/data/builds/jev-port")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the checkout this script lives in
 from serve import jev_calib                                    # noqa: E402
 
 KNOWN = {"tuple", "a_noul", "c_noul", "T_choice", "T_score", "provenance"}
