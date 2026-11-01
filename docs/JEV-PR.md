@@ -197,7 +197,7 @@ tree, `calib=platt_v1` served:
 - banking77, 100 items, C vs B paired: is_card .670 vs .660 (1 discordant, McNemar p=1.000),
   group .700 vs .730 (0 vs 3, p=.250), both .510 vs .510 (1 vs 1, p=1.000); Brier .2278 vs .2339.
   **Same conclusion as 4a: no arm has an accuracy claim.**
-- image suite, direct, `calib-D` served, 100 test items: POPE .883 → .900 (1 flip, p=1.000),
+- image suite, direct, `calib-D` served (the fit this repo used to ship; it no longer does), 100 test items: POPE .883 → .900 (1 flip, p=1.000),
   CV-Bench .650 → .650 (0 flips), CountBench 1.000 → 1.000 (0 flips); Brier deltas +.003/−.007/−.003,
   all inside the box's run-to-run variation.
 
@@ -217,8 +217,10 @@ engine — the part this PR changes — is the build from this tree.
 | D\|choice\|CV-Bench | 20 | .650 → .650 | .944 → **.863** | .145 → .260* |
 | D\|score\|CountBench | 20 | 1.000 → 1.000 | .102 → **.036** | .091 → **.033** |
 
-*CVB n=20, bin-noise territory; NLL improves, acc flat. Fitted: L a=.6127 c=.6539
-Tc=1.0557 Ts=2.263 · D a=1.0571 c=−.172 Tc=1.5456 Ts=.6555.
+*CVB n=20, bin-noise territory; NLL improves, acc flat. The "cal" columns above were produced with
+the fits this repository **used to ship** - L `a=.6127 c=.6539 Tc=1.0557 Ts=2.263`, D `a=1.0571
+c=−.172 Tc=1.5456 Ts=.6555`. Neither ships any more (`calib/README.md`): they are someone else's
+prior. The "raw" columns are what a fresh checkout produces, and are the numbers to quote.
 Also shown in `calib-prepost-ab.json`: the OLD single global calibrator made image
 tuples WORSE than raw (CountBench ECE .091→.451!) — the per-tuple fix is the story.
 
@@ -232,8 +234,8 @@ suites now: BoolQ .910 → .910 (raw ECE .049), ARC 1.000 → 1.000 (ECE .007), 
 the refit *hurting* test ECE (.127 → .140, both arms). The calibrator has not regressed — the
 readout improved underneath it. Fits now come back near identity (BoolQ `a=1.009 c=.0037` for the
 opt-in arm, `a=1.032 c=.062` for the default arm), which is the signature of a tuple with no
-headroom left. The same is true of the image tuples: refitting on top of the shipped calibrator
-asks for `T=.985`/`T=.984` and `a=1.066, c=−.003`.
+headroom left. The same is true of the image tuples: refitting on top of the previously shipped
+calibrator asks for `T=.985`/`T=.984` and `a=1.066, c=−.003`.
 
 **Per-task calibration is real; portable calibration is not.** Platt fitted on banking77 (2-field,
 600 items, held out 200):
@@ -297,29 +299,50 @@ weakest available detector of a temperature change.
 ### 4b. Benchmark vs jevcpp's own benchmark (donor m2_baseline, same 3 tasks)
 
 Donor: Qwen3.8-27B q4_k_xl, dense, its own server. Port: QFN IQ3_XXS MoE, Strata.
-Same task sets (BoolQ / ARC / SST-5 slices from jevcpp's eval data), same metrics
-code, post-calibration numbers:
+Same task sets (BoolQ / ARC / SST-5 slices from jevcpp's eval data), same metrics code.
 
-| task | jevcpp 27B (donor) | jev-port QFN (this PR) | port, donor-ECE defn* |
+**No calibrator ships in this PR** (see `calib/README.md`): a fit is a claim about one data
+distribution, and applying someone else's cost 9.6 accuracy points on a different task. So the
+quotable column for this PR is **no fit** — what a fresh checkout produces. The **fitted** column is
+the same items with a Platt/temperature fit made on that run's own dev split, reproducible with
+`scripts/refit_calib.py` and the documented procedure in `docs/OPTIMISING.md`. Both come from
+`bench-artifacts/2026-10-23-text-ab-identity/` (calibrator removed, so "raw" there is genuinely raw).
+
+| task | jevcpp 27B (donor) | port, **no fit** (default) | port, fitted on own dev split |
 |---|---|---|---|
-| BoolQ noul acc | 0.905 raw / 0.890 cal | 0.910 cal | — |
-| BoolQ ECE15 | 0.036 raw / 0.049 cal | 0.033 cal | 0.035 cal |
-| ARC choice acc | 0.990 | 1.000 | — |
-| SST-5 score acc | 0.569 | 0.520 (−4.9pp ≈ 1 SE at n=100) | — |
-| SST-5 ECE15 | 0.110 raw / **0.030** cal | 0.154 cal | 0.156 cal |
-| SST-5 NLL | 1.103 raw / 1.031 cal | 1.049 cal | — |
+| BoolQ noul acc | 0.905 raw / 0.890 cal | **0.890 / 0.900** | 0.910 |
+| BoolQ ECE15 | 0.036 raw / 0.049 cal | 0.069 / 0.070 | 0.022 / 0.029 |
+| BoolQ NLL | — | 0.296 / 0.305 | 0.262 / 0.266 |
+| ARC choice acc | 0.990 | **1.000** | 1.000 |
+| ARC ECE15 | — | 0.005 | 0.006 / 0.007 |
+| SST-5 score acc | 0.569 | **0.500 / 0.520** | 0.500 / 0.520 (0 flips) |
+| SST-5 ECE15 | 0.110 raw / **0.030** cal | 0.292 / 0.310 | 0.161 / 0.174 |
+| SST-5 NLL | 1.103 raw / 1.031 cal | 1.454 / 1.464 | 1.038 / 1.043 |
+
+Where two numbers appear they are suites B and C of the identity set: same binary, different
+dev/test slice, so the spread is the split's, not the model's. Earlier revisions of this table quoted
+a single post-calibration figure per task without the no-fit counterpart; those figures were measured
+with a fittable calibrator installed and are no longer reproducible from a fresh checkout. Nothing in
+the conclusions below depended on them — calibration changes **4-5 answers out of 100 on BoolQ and
+zero on ARC and SST-5** — but a reader should not have to infer that.
 
 *Both ECE variants are top-label, 15 bins; the donor scores each bin at its CENTER
 ((b+0.5)/15), this PR's harness scores the bin MEAN confidence. The donor-definition
 column recomputes our logged raw_p under the donor's exact b13_eval formula so the
 comparison is apples-to-apples. Under either definition the direction is the same.
 
-The 26B-smaller IQ3 MoE matches the donor within ~1 standard error on noul and choice
-(at n=100, SE≈3-5pp); score is −4.9pp (≈1 SE; the confounds are model size, MoE vs
-dense, and quant — not separable at this n). Donor noul calibration HURT it
-(0.905→0.890 acc); ours helps (0.890→0.910). SST-5 calibrated ECE remains ~5× the
-donor's under both definitions — T_score=2.263 is doing damage control on a weak
-5-way readout, not achieving donor-grade confidence. Stated plainly.
+**Reading it without a fit.** The 26B-smaller IQ3 MoE matches the donor on choice (1.000 vs 0.990)
+and is within ~1 standard error on noul (0.890/0.900 vs 0.905 raw; SE≈3-5pp at n=100). Score is
+−4.9 to −6.9pp (≈1-1.4 SE); the confounds are model size, MoE vs dense, and quant — not separable at
+this n. Noul calibration direction: fitted on its own dev split the donor's fit HURT it
+(0.905→0.890 acc) while ours helps (0.890→0.910), with a slope near identity (a≈0.62) and the
+offset doing the work. Without any fit the port is simply the left-of-slashes number.
+
+**Confidence is where a fit does real work, and where the port is weak.** SST-5 ECE15 goes
+0.292→0.161 fitted, still ~5× the donor's 0.030 under both definitions. A fitted `T_score` of
+2.26-2.34 is doing damage control on a weak 5-way readout, not achieving donor-grade confidence.
+That is a property of the readout, so it is quoted fitted *and* unfitted rather than shipped as a
+parameter: if you want it, fit it on your own data.
 
 ### 4c. Performance (warm, single client, n=10 per cell)
 

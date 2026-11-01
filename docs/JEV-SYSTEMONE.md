@@ -152,8 +152,14 @@ Two more rules that measurement forced:
   identity (move `calib-*.json` aside) for any raw→fit measurement, and compare arms only after
   inverting a known transform.
 
-`calib/calib-L.json`, `calib-D.json`, `calib-S.json` are the per-tuple files (L = text,
-D = image direct, S = image summary), read at startup, hot-swapped via `POST /admin/calib`
+**No calibrator files ship in this repository.** The per-tuple files (L = text, D = image direct,
+S = image summary) are yours to fit: see `calib/README.md` for the four-step procedure and
+`docs/OPTIMISING.md` for where calibration sits among the levers that actually move accuracy. Why
+nothing ships: a fit is a claim about one distribution, and a cross-task fit measured **-9.6
+accuracy points** when applied to a different task. With no files present every readout runs
+identity and says so (`"calib": "identity"`).
+
+A file you do supply is read at startup and hot-swapped via `POST /admin/calib`
 (Bearer `STRATA_JEV_ADMIN_KEY`; empty key = open like the rest of the control plane). A file whose
 keys the loader does not read (e.g. `a`/`c`) loads as identity while still honouring its `T` — a
 silent half-fit; `STRATA_JEV_CALIB_STRICT=1` refuses that file instead. Every answered question
