@@ -1,5 +1,9 @@
 # Calibrating the jev decision surface — per-task refit
 
+**This page is the calibration reference. For the practical order of operations on your own
+data - definitions, derived fields, labelled sets, then calibration - start with
+[Optimising accuracy](OPTIMISING.md).**
+
 **Read this if** your answers come back more confident than they deserve, or if the
 yes/no field is skewed toward one class. The short version: **calibration is only valid
 on the task family it was fitted on**, so every distinct task gets its own fit.

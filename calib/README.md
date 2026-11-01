@@ -23,6 +23,10 @@ Measured, all on the same binary, only the calibrator differing:
 So the repository ships the **procedure** and not the **parameters**. Anything you fit is yours, for
 your task, evaluated on items it never saw.
 
+This file covers calibration only. For the end-to-end process - defining your categories, deriving
+fields instead of asking for them, building a labelled set, and measuring - read
+[**docs/OPTIMISING.md**](../docs/OPTIMISING.md). Calibration is step 5 of 6, and step 1 buys more than it does.
+
 ## The procedure, in the order that saves the most time
 
 **Step 0 - ask whether calibration can help at all.** This is the cheap question and it usually

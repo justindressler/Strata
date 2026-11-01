@@ -13,6 +13,7 @@
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |
 | Fix an install or startup problem | [Troubleshooting](TROUBLESHOOTING.md) |
 | Check privacy, downloads and network access | [Safety and privacy](SAFETY.md) |
+| Improve accuracy on my own dataset | [Optimising accuracy](OPTIMISING.md) |
 
 ## Hardware
 
