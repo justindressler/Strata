@@ -183,5 +183,24 @@ class TaskScopedCalibration(unittest.TestCase):
                             "a tagged historical fit must be refused for another task")
 
 
+    # ── 9. no shipped fit may declare a key the loader drops ───────────────
+    def test_no_shipped_fit_declares_unread_keys(self):
+        """calib-S.json shipped \"a\"/\"c\" - keys the loader never reads - so its noul fit was silently
+        identity while T_choice/T_score were honoured: a half-fitted calibrator. STRICT mode refuses
+        that shape, but STRICT is opt-in, so the shape must not ship at all.
+        """
+        import json as _json
+        import pathlib as _pathlib
+        here = _pathlib.Path(__file__).resolve().parent.parent / "calib"
+        for f in sorted(here.glob("calib-*.json")):
+            j = _json.loads(f.read_text())
+            unknown = set(j) - jev_calib._KNOWN_KEYS
+            self.assertEqual(unknown, set(),
+                             f"{f.name} declares {sorted(unknown)}, which the loader silently drops")
+            for legacy in ("a", "c"):
+                self.assertNotIn(legacy, j, f"{f.name} uses the legacy {legacy!r} key (loader wants "
+                                            f"a_noul/c_noul) - the fit would not be applied")
+
+
 if __name__ == "__main__":
     unittest.main()
