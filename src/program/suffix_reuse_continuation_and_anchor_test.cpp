@@ -24,9 +24,9 @@
 // THE FIX.  `compute_suffix_plan` must use the longest common PREFIX from the FRONT for
 // `edit_pos`, not the suffix walk.  For a pure continuation (`old` is a prefix of `new`):
 //   LCP = n_old, edit_pos = n_old = resume.  No narrowing (plan_edit_pos < resume is false).
-//   The splice is also a no-op: old_suffix_len = new_suffix_len = 0 (the only "common suffix"
-//   token was the EOS, not a real content match).  The runtime's apply_splice is gated on
-//   old_suffix_len > 0, so no K rotation.  The checks.erase predicate `length > edit_pos`
+//   The plan is also a no-op: old_suffix_len = new_suffix_len = 0 (the only "common suffix"
+//   token was the EOS, not a real content match).  The (removed) K-rotation layer was gated
+//   on old_suffix_len > 0, so no K was ever touched.  The checks.erase predicate `length > edit_pos`
 //   drops nothing (resume-length ckpt survives).  Mount is byte-identical to flag-OFF.
 //
 // RED ON THE PRE-FIX STATE (ce20ef3): the current `compute_suffix_plan` walks the suffix from
@@ -192,7 +192,7 @@ int main() {
         check(outcome.plan_edit_pos == 3240,
               "T9.1 LIVE: outcome.plan_edit_pos == 3240 (= resume; runtime does NOT narrow)");
         check(outcome.old_suffix_len == 0,
-              "T9.1 LIVE: outcome.old_suffix_len == 0 (apply_splice is gated on >0; no K rotation)");
+              "T9.1 LIVE: outcome.old_suffix_len == 0 (the removed rotation layer was gated on >0; no K was touched)");
         check(outcome.chain.size() == 1 && outcome.chain[0].length == 3240,
               "T9.1 LIVE: chain drops 3244 (length > edit_pos 3240), keeps resume ckpt at 3240 (1 survivor)");
 
@@ -202,11 +202,12 @@ int main() {
         check(!runtime_would_narrow,
               "T9.1 LIVE: runtime does NOT narrow resume (edit_pos == resume; mount survives)");
 
-        // The runtime rotation gate at generate.cpp:9088: `if (outcome.old_suffix_len > 0)`.
-        // For continuation, old_suffix_len == 0, so apply_splice is NOT called -> no K rotation.
+        // The runtime rotation gate (historical, generate.cpp: `if (outcome.old_suffix_len > 0)`).
+        // For continuation, old_suffix_len == 0 - and the rotation layer itself was removed
+        // after review - so K is never touched on this path.
         const bool runtime_would_rotate = outcome.old_suffix_len > 0;
         check(!runtime_would_rotate,
-              "T9.1 LIVE: runtime does NOT rotate K (old_suffix_len == 0; apply_splice skipped)");
+              "T9.1 LIVE: runtime does NOT touch cached K (old_suffix_len == 0; the rotation layer is gone)");
 
         // The runtime erasure at generate.cpp:9045-9055: drops `length > plan_edit_pos` from
         // `outcome.chain`.  For continuation, the drop predicate is `length > 3240`; 3240 is

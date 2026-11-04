@@ -105,8 +105,6 @@
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/program/suffix_reuse.hpp"
-#include "strata/program/kv_splice_apply.hpp"          // Phase 2 Task 2: kernel-level helper + SpliceStatus enum
-#include "strata/program/kv_splice_apply_session.hpp" // Phase 2 Task 2: SessionState wrapper for apply_splice
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_vocab.hpp"
 #include "strata/spec/window_rule.hpp"
@@ -12219,9 +12217,12 @@ int main(int argc, char** argv) {
                     // ~10 anchors at needle scale - the head region periodic cadence goes
                     // sparse (max(every, 8192)) and the state pool is what keeps deep
                     // anchors there.  Host RAM only (checkpoint_save copies to host vectors).
+                    // (B2 fix: the cap is `2048LL << 20` - `2048 << 20` as int overflows to a
+                    // negative value, the comparison was always true and the pool always
+                    // emptied itself to zero anchors.)
                     int64_t state_bytes = 0;
                     for (const ConvCheckpoint& k : state_checks) state_bytes += (int64_t) k.bytes();
-                    while (!state_checks.empty() && state_bytes > 2048 << 20) {
+                    while (!state_checks.empty() && state_bytes > 2048LL << 20) {
                         state_bytes -= (int64_t) state_checks.front().bytes();
                         state_checks.erase(state_checks.begin());   // oldest first
                     }
@@ -15757,11 +15758,10 @@ int main(int argc, char** argv) {
                     // hook's narrowing decision.  For a pure continuation plan.edit_pos == resume
                     // (the resume checkpoint IS a prefix of cur, common suffix is the whole
                     // checkpoint) and the comparison fails - resume UNCHANGED.  For a mid-prompt
-                    // edit, plan.edit_pos < resume and the engine re-reads from there.  Today's
-                    // re-read path is replaced on the splice path by `apply_splice` (below), which
-                    // rotates the cached K rows of the tail in-place; V is untouched; positions
-                    // are re-derived per prefill step.  This is the F4(a) verification target:
-                    // edit-at-E yields resume <= E.
+                    // edit, plan.edit_pos < resume and the engine re-reads from there.  The
+                    // re-read path below IS the path (the K-rotation splice layer was removed
+                    // after review: it never saved work and corrupted K in one reachable case).
+                    // This is the F4(a) verification target: edit-at-E yields resume <= E.
                     //
                     // Phase 2 Task 5: `replay_from == plan_edit_pos == outcome.replay_from` from
                     // the outcome, and `resume = read_from = plan_edit_pos` after this narrowing.
@@ -15774,38 +15774,6 @@ int main(int argc, char** argv) {
                         splice_narrowed = true;
                         splice_narrowed_resume = outcome.plan_edit_pos;
                         resume = outcome.plan_edit_pos;
-                    }
-                    // Phase 2 Task 2: apply the splice (host-loop rotation of K rows in the QSA
-                    // k_pool, V untouched).  Gated `old_suffix_len > 0` so a pure continuation
-                    // (plan.old_suffix_len == 0) does no rotation.  The runtime guard inside
-                    // `apply_splice` logs SPLICE_UNSUPPORTED for kv != fp16 / kv_resident / layer
-                    // split and returns without touching K, matching the startup guard from
-                    // Task 4.  When the splice is unsupported we ALSO log REPLAY_NOT_AVAILABLE
-                    // (Task 5 NEW-5: the linear-state replay path falls back to today's prefill
-                    // in those same cases - no snapshot present, kv != fp16, layer split - and
-                    // `read_from == resume` (narrowed) below reuses the existing prefill path,
-                    // which the brief says MUST remain intact).
-                    if (outcome.old_suffix_len > 0) {
-                        const strata::program::suffix_reuse::SpliceStatus sstatus =
-                            suffix::apply_splice(outcome, ss, g, nullptr);
-                        std::fprintf(stderr, "[SFX-DBG] apply_splice(strict): status=%d old_suffix_len=%lld\n",
-                                     (int) sstatus, (long long) outcome.old_suffix_len);
-                        if (sstatus != strata::program::suffix_reuse::SpliceStatus::Rotated &&
-                            sstatus != strata::program::suffix_reuse::SpliceStatus::NoOp) {
-                            const char* reason =
-                                (sstatus == strata::program::suffix_reuse::SpliceStatus::UnsupportedFormat)
-                                    ? "head_dim is not 256 in a rotated (kv_rot or q4) store, or an unhandled pool layout (fp16, int8, k8v4, q4_0 and int8+kv_rot are supported)"
-                                    : (sstatus == strata::program::suffix_reuse::SpliceStatus::UnsupportedResident)
-                                      ? "kv_resident > 0 (ring-layout splice is future work)"
-                                      : (sstatus == strata::program::suffix_reuse::SpliceStatus::UnsupportedSplit)
-                                        ? "layer split active (per-stage splice is future work)"
-                                        : "no applicable snapshot / reasons unstated";
-                            std::fprintf(stderr,
-                                "[strata] suffix-reuse: REPLAY_NOT_AVAILABLE: %s.  "
-                                "Falling through to today's re-read path; the linear-state "
-                                "replay (GDN recurrence + PLE history) will be re-read instead "
-                                "of spliced (P2 Task 5).\n", reason);
-                        }
                     }
                 }
             }
@@ -16233,20 +16201,19 @@ int main(int argc, char** argv) {
             //   1. mounted the parked image (line 9217-9284), restoring the K/V arena and the
             //      running state at length L (the parked image's `live.ids.size()`).
             //   2. set `resume = parked.tokens` (= P, the LCP) and `from_live = parked.live`.
-            //   3. now runs the partial helper to compute the splice plan (LCP-based narrow_pos
-            //      = P, suffix-based edit_pos for the K rotation in [P, L)).
+            //   3. now runs the partial helper to compute the plan (LCP-based narrow_pos
+            //      = P, suffix-based edit_pos for the tail in [P, L)).
             // The helper's outcome drives the same downstream path as the strict splice hook:
-            // chain erase, splice_narrowed, apply_splice, resume narrowing.  The
+            // chain erase, splice_narrowed, resume narrowing.  The
             // `restore_anchor_length` (= L) is surfaced on the `NarrowedResumeTarget` so the
             // splice-narrowed branch below restores the anchor C (not the P-depth resume) and
             // the chunk loop reads from P.
             //
             // The K/V cells for [0, P) are valid (the restore gave us the parked image's K/V
             // for [0, L); we use [0, P)).  The K/V cells for [P, L) are stale (the mid-file
-            // edit changed the prompt at P) but the prefill overwrites them.  The K rotation
-            // in [P, L) (when old_suffix_len > 0) is wasted by the prefill but harmless - the
-            // gap-read [P, n) is the actual saving.  With old_suffix_len == 0 (no common tail
-            // from the back), apply_splice is gated out and the prefill is the only path.
+            // edit changed the prompt at P) but the prefill overwrites them - the gap-read
+            // [P, n) after the checkpoint restore is the actual saving (the K-rotation splice
+            // layer that used to run here was removed after review).
             if (o.cache_suffix_reuse > 0)
                 std::fprintf(stderr, "[SFX-DBG] partial-branch: incoming=%d parked.partial=%d parked.tokens=%lld resume=%lld cur=%lld -> enter=%d\n",
                              incoming.has_value() ? 1 : 0, parked.partial ? 1 : 0, (long long) parked.tokens,
@@ -16275,10 +16242,6 @@ int main(int argc, char** argv) {
                     const std::vector<int32_t> cur_tokens(cur.begin(), cur.end());
                     const suffix::SuffixHookOutcome outcome = suffix::suffix_reuse_partial_apply(
                         *ck_tokens, cur_tokens, parked.checkpoint_length, parked.tokens, chain);
-                    std::fprintf(stderr, "[SFX-DBG] partial-outcome: fired=%d plan_edit_pos=%lld old_suffix_len=%lld restore_anchor=%lld k_rot_start=%lld\n",
-                                 outcome.fired ? 1 : 0, (long long) outcome.plan_edit_pos,
-                                 (long long) outcome.old_suffix_len, (long long) outcome.restore_anchor_length,
-                                 (long long) outcome.k_rotation_start);
                     if (outcome.fired) {
                         // Erase chain entries using the helper's index field (same pattern as
                         // the strict splice hook at line 9042-9056).
@@ -16302,35 +16265,12 @@ int main(int argc, char** argv) {
                         if (outcome.plan_edit_pos < resume) {
                             resume = outcome.plan_edit_pos;
                         }
-                        // Apply the K rotation if the plan has a non-trivial tail.  Same gating
-                        // as the strict splice hook at line 9089.
-                        if (outcome.old_suffix_len > 0) {
-                            const strata::program::suffix_reuse::SpliceStatus sstatus =
-                                suffix::apply_splice(outcome, ss, g, nullptr);
-                            std::fprintf(stderr, "[SFX-DBG] apply_splice(partial): status=%d old_suffix_len=%lld\n",
-                                         (int) sstatus, (long long) outcome.old_suffix_len);
-                            if (sstatus != strata::program::suffix_reuse::SpliceStatus::Rotated &&
-                                sstatus != strata::program::suffix_reuse::SpliceStatus::NoOp) {
-                                const char* reason =
-                                    (sstatus == strata::program::suffix_reuse::SpliceStatus::UnsupportedFormat)
-                                        ? "head_dim is not 256 in a rotated (kv_rot or q4) store, or an unhandled pool layout (fp16, int8, k8v4, q4_0 and int8+kv_rot are supported)"
-                                        : (sstatus == strata::program::suffix_reuse::SpliceStatus::UnsupportedResident)
-                                          ? "kv_resident > 0 (ring-layout splice is future work)"
-                                          : (sstatus == strata::program::suffix_reuse::SpliceStatus::UnsupportedSplit)
-                                            ? "layer split active (per-stage splice is future work)"
-                                            : "no applicable snapshot / reasons unstated";
-                                std::fprintf(stderr,
-                                    "[strata] suffix-reuse: REPLAY_NOT_AVAILABLE (partial mount): %s.  "
-                                    "Falling through to the re-read path; the [P, n) prefill recomputes K+V.\\n", reason);
-                            }
-                        }
                         // Surface the restore anchor for the splice-narrowed branch below.
                         splice_restore_anchor_length = outcome.restore_anchor_length;
                         std::fprintf(stderr,
-                            "strata serve: partial-prefix mount: L=%lld P=%lld (splice_narrowed=%d, k_rotation_start=%lld, old_suffix_len=%lld)\\n",
+                            "strata serve: partial-prefix mount: L=%lld P=%lld (splice_narrowed=%d)\n",
                             (long long) outcome.restore_anchor_length, (long long) outcome.plan_edit_pos,
-                            splice_narrowed ? 1 : 0, (long long) outcome.k_rotation_start,
-                            (long long) outcome.old_suffix_len);
+                            splice_narrowed ? 1 : 0);
                     }
                 }
             }
@@ -16450,25 +16390,22 @@ int main(int argc, char** argv) {
                     {
                         splice_target = suffix::narrowed_resume_target_state(
                             splice_narrowed_resume, chain_lengths, state_lengths);
-                        // T18 (2026-10-13): replay-gated gap read.  dt-steady5 proved reading
-                        // [P, n) on state@checkpoint loses the gap [ckpt, P) from the GDN/PLE
-                        // recurrence (C under-counted the ledger; gap 826 tokens).  Fail-closed
-                        // default: read from the checkpoint (byte-equal to strict semantics);
-                        // STRATA_SFX_REPLAY=1 (FW-2 day) restores the gap-read [P, n).
-                        static const bool sfx_replay_on =
-                            std::getenv("STRATA_SFX_REPLAY") != nullptr;
+                        // T18 (2026-10-13): always-fail-closed gap read.  dt-steady5 proved
+                        // reading [P, n) on state@checkpoint loses the gap [ckpt, P) from the
+                        // GDN/PLE recurrence (C under-counted the ledger; gap 826 tokens), and
+                        // the replay that would have covered the gap never shipped (the splice
+                        // layer that gated on it was removed after review).  The partial mount
+                        // therefore reads from the deepest checkpoint restored through:
+                        // read_from == restore_length, byte-equal to strict semantics; the
+                        // prefill re-reads [restore, P) before continuing to n.
                         if (splice_restore_anchor_length > 0)
-                            splice_target.read_from = suffix::partial_gap_read_from(
-                                sfx_replay_on, splice_narrowed_resume, chain_lengths);
+                            splice_target.read_from = splice_target.restore_length;
                         // Resume becomes the restore length (the deepest surviving checkpoint at
                         // or below the splice-narrowed resume, or 0 when none survives - in
                         // which case this is a fresh prefill from 0, no error).  The chunk
-                        // loop's read_from is `splice_target.read_from` (= the edit pos E)
-                        // via `wire_splice_read_from` below: the prefill processes [E, n) only,
-                        // the [C, E) gap is covered by the anchor restore (no re-read), and
-                        // the splice's K rotation in `apply_splice` covers [E, n) in cache
-                        // (the prefill recomputes K+V for [E, n) - the rotation is redundant
-                        // but the gap-read is the real saving).
+                        // loop's read_from is `splice_target.read_from` via
+                        // `wire_splice_read_from` below: the prefill processes [read_from, n)
+                        // only and the restored anchor covers [0, restore_length).
                         resume = splice_target.restore_length;
                     }
                     if (resume == 0) {

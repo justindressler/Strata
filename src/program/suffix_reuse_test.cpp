@@ -10,10 +10,9 @@
 // T2: pure invalidation - checkpoints whose length > E drop.
 // T4: composite edit (insert+delete in different places) - per-token deltas correct.
 //
-// T3 (RoPE CPU rotation via `rope_neox_pair`) and T5 (chain integration) and T8 (fail-closed guards)
-// live in the same test TU and gate on STRATA_ROPE_TEST_TABLES / STRATA_SUFFIX_T8 so each can run alone.
+// T5 (chain integration) and T8 (fail-closed guards) live in the same test TU.
+// T3 (RoPE rotation of the removed splice layer) was deleted with the splice.
 #include "strata/program/suffix_reuse.hpp"
-#include "strata/program/kv_splice.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/core/conversation_cache.hpp"
 
@@ -91,148 +90,8 @@ int main() {
         check(dropped == 2, "T2: edit at 0 invalidates every checkpoint");
     }
 
-    // --- T3: RoPE CPU rotation via host loop over rope_neox_pair ---------------------
-    // build cos/sin tables twice (once via the host port of build_rope_table, once from scratch at
-    // the NEW position) and assert rotate_k_by_delta over an OLD K equals the rotation applied at NEW.
-    // The tolerance matches rope_parity.cpp: 1e-6 (float32 ULP).
-    {
-        const int n_rot = 64;           // partial-rotation width (32 pairs, head_dim = 256)
-        const int head_dim = 256;
-        const int half = n_rot / 2;
-        const double theta = 1000000.0; // arbitrary - the math is the same shape as the model's
-        const int max_pos = 2048;
-        std::vector<float> cos_a((size_t) max_pos * (size_t) half), sin_a((size_t) max_pos * (size_t) half);
-        std::vector<float> cos_b = cos_a, sin_b = sin_a;
-        strata::program::suffix_reuse::build_rope_table_host(n_rot, theta, max_pos, cos_a.data(), sin_a.data());
-        // the CUDA builder body, transcribed for the cross-check (this is its single consumer in
-        // the test - the production path uses the build_rope_table_host port above)
-        for (int p = 0; p < max_pos; ++p) {
-            for (int i = 0; i < half; ++i) {
-                const double inv = std::pow(theta, -2.0 * (double) i / (double) n_rot);
-                const double ang = (double) p * inv;
-                cos_b[(size_t) p * (size_t) half + (size_t) i] = (float) std::cos(ang);
-                sin_b[(size_t) p * (size_t) half + (size_t) i] = (float) std::sin(ang);
-            }
-        }
-        int t3_fail = 0;
-        for (size_t i = 0; i < cos_a.size(); ++i) {
-            const float da = cos_a[i] - cos_b[i], db = sin_a[i] - sin_b[i];
-            if (std::fabs(da) > 1e-6f || std::fabs(db) > 1e-6f) ++t3_fail;
-        }
-        check(t3_fail == 0, "T3: host cos/sin tables match the transcribed CUDA builder to 1e-6");
-
-        // build a row at old_pos from a deterministic seed, rotate it by `delta`, compare with the
-        // row built + rotated at new_pos.  exercises `rotate_row_by_delta` directly.
-        //
-        // Contract (F3): cached K is POST-RoPE at old_pos.  rotate_row_by_delta must re-rotate
-        // that cached row by the DELTA angle so the result equals rotate(raw, new_pos).  Builds
-        // the cached row explicitly (rotate_at(raw, old_pos)) so a buggy helper that applies the
-        // full new_pos rotation to an unrotated row cannot pass.
-        auto make_row = [&](int p) {
-            std::vector<float> k((size_t) head_dim, 0.0f);
-            for (int i = 0; i < head_dim; ++i) k[i] = std::sin(0.013f * (float) i + 0.7f * (float) p);
-            return k;
-        };
-        // explicit RoPE at position `p` over the first n_rot elements (NEOX pairing)
-        auto rotate_at = [&](const std::vector<float>& src, int p) {
-            std::vector<float> out = src;
-            const int p_clamped = p < max_pos ? p : max_pos - 1;
-            for (int i = 0; i < half; ++i) {
-                const float c = cos_a[(size_t) p_clamped * (size_t) half + (size_t) i];
-                const float s = sin_a[(size_t) p_clamped * (size_t) half + (size_t) i];
-                float oa, ob;
-                strata::kernels::rope_neox_pair(out[i], out[i + half], c, s, oa, ob);
-                out[i] = oa;
-                out[i + half] = ob;
-            }
-            return out;
-        };
-
-        // ground-truth numeric case from the reviewer (F2): raw_a=0.3, raw_b=-0.8 at pair i=5,
-        // theta=1e6, n_rot=64, old_pos=7, delta=4 -> rotate(raw, new_pos=11) at pair i=5
-        // is (0.852952, 0.049727) to 1e-6.  Pin this pair inside the row-scan loop below.
-        {
-            std::vector<float> raw((size_t) head_dim, 0.0f);
-            for (int i = 0; i < head_dim; ++i) raw[i] = std::sin(0.013f * (float) i + 0.7f * (float) 7);
-            raw[5] = 0.3f;
-            raw[5 + half] = -0.8f;
-            std::vector<float> cached = rotate_at(raw, 7);
-            std::vector<float> helper_out = cached;
-            strata::program::suffix_reuse::rotate_row_by_delta(
-                helper_out.data(), head_dim, n_rot, 7, 4, cos_a.data(), sin_a.data(), max_pos);
-            std::vector<float> expected = rotate_at(raw, 11);
-            const float err_a = std::fabs(helper_out[5] - expected[5]);
-            const float err_b = std::fabs(helper_out[5 + half] - expected[5 + half]);
-            check(err_a < 1e-6f && err_b < 1e-6f,
-                  "T3: reviewer's ground truth - pair (0.3,-0.8) at pair i=5, old_pos=7, delta=4 -> "
-                  "helper matches rotate(raw, new_pos=11) to 1e-6 (fresh=(0.852952, 0.049727))");
-        }
-
-        int t3_pos_fail = 0;
-        int t3_neg_fail = 0;
-        int t3_zero_fail = 0;
-        int t3_clamp_fail = 0;
-        // positive delta (insertion)
-        for (int old_pos : {0, 7, 31}) {
-            for (int delta : {1, 4}) {
-                const int new_pos = old_pos + delta;
-                std::vector<float> raw = make_row(old_pos);
-                std::vector<float> cached = rotate_at(raw, old_pos);
-                std::vector<float> helper_out = cached;
-                strata::program::suffix_reuse::rotate_row_by_delta(
-                    helper_out.data(), head_dim, n_rot, old_pos, delta,
-                    cos_a.data(), sin_a.data(), max_pos);
-                std::vector<float> expected = rotate_at(raw, new_pos);
-                for (int i = 0; i < n_rot; ++i)
-                    if (std::fabs(helper_out[i] - expected[i]) > 1e-6f) ++t3_pos_fail;
-            }
-        }
-        // negative delta (deletion) - old_pos large enough that new_pos stays >= 0
-        for (int old_pos : {7, 31, 100}) {
-            for (int delta : {-1, -3}) {
-                const int new_pos = old_pos + delta;
-                std::vector<float> raw = make_row(old_pos);
-                std::vector<float> cached = rotate_at(raw, old_pos);
-                std::vector<float> helper_out = cached;
-                strata::program::suffix_reuse::rotate_row_by_delta(
-                    helper_out.data(), head_dim, n_rot, old_pos, delta,
-                    cos_a.data(), sin_a.data(), max_pos);
-                std::vector<float> expected = rotate_at(raw, new_pos);
-                for (int i = 0; i < n_rot; ++i)
-                    if (std::fabs(helper_out[i] - expected[i]) > 1e-6f) ++t3_neg_fail;
-            }
-        }
-        // delta = 0 - helper is the identity (cached already rotated at old_pos, no change)
-        for (int old_pos : {0, 7, 31}) {
-            std::vector<float> raw = make_row(old_pos);
-            std::vector<float> cached = rotate_at(raw, old_pos);
-            std::vector<float> helper_out = cached;
-            strata::program::suffix_reuse::rotate_row_by_delta(
-                helper_out.data(), head_dim, n_rot, old_pos, 0,
-                cos_a.data(), sin_a.data(), max_pos);
-            std::vector<float> expected = rotate_at(raw, old_pos);  // == cached
-            for (int i = 0; i < n_rot; ++i)
-                if (std::fabs(helper_out[i] - expected[i]) > 1e-6f) ++t3_zero_fail;
-        }
-        // new_pos >= max_pos clamp: clamp to (max_pos-1), expected uses the same clamp
-        {
-            const int old_pos = 1024;
-            const int delta = 4096;       // new_pos = 5120, max_pos = 2048 -> clamp to 2047
-            std::vector<float> raw = make_row(old_pos);
-            std::vector<float> cached = rotate_at(raw, old_pos);
-            std::vector<float> helper_out = cached;
-            strata::program::suffix_reuse::rotate_row_by_delta(
-                helper_out.data(), head_dim, n_rot, old_pos, delta,
-                cos_a.data(), sin_a.data(), max_pos);
-            std::vector<float> expected = rotate_at(raw, max_pos - 1);  // expected honours the clamp
-            for (int i = 0; i < n_rot; ++i)
-                if (std::fabs(helper_out[i] - expected[i]) > 1e-6f) ++t3_clamp_fail;
-        }
-        check(t3_pos_fail == 0,  "T3: positive delta: helper(cached) == rotate(raw, new_pos) for all (old_pos, delta)");
-        check(t3_neg_fail == 0,  "T3: negative delta (deletion): helper(cached) == rotate(raw, new_pos) for all (old_pos, delta)");
-        check(t3_zero_fail == 0, "T3: delta=0: helper(cached) is identity (cached already rotated at old_pos)");
-        check(t3_clamp_fail == 0,"T3: new_pos >= max_pos clamp: helper and expected both clamp to max_pos-1");
-    }
+    // --- T3 (RoPE CPU rotation of the removed splice layer) was deleted with the splice:
+    //     its host rope-table / row-rotation helpers lived in the deleted splice header. ---
 
     // --- T5: integration with retain/limit_reuse on a synthetic ConversationCache ------
     // the splice plan's `invalidate_checkpoints` runs BEFORE retain/limit_reuse, so the surviving

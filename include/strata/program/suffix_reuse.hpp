@@ -126,9 +126,7 @@ SuffixReusePlan compute_suffix_plan(const std::vector<T>& old_tokens, const std:
     // The resume checkpoint is a prefix of cur (LCP == n_old): the splice is a no-op.  Any
     // common-suffix tokens are coincidental (e.g. the EOS token at the turn boundary that
     // appears at the end of both old and new); they do not represent content the splice
-    // can usefully rotate - rotating a single EOS K row by +54 lands it past the new prompt's
-    // last position, and the prefill overwrites it anyway.  Set tail lengths to 0 so the
-    // runtime's `apply_splice` is gated out (line 9088 in generate.cpp: `if (old_suffix_len > 0)`).
+    // Set tail lengths to 0 so a pure continuation carries no tail plan.
     // narrow_pos stays at n_old (= resume) so the runtime does not narrow.  edit_pos (legacy)
     // stays at n_old - suffix = 0 if the EOS matches, or n_old if not - the legacy field's
     // value is irrelevant when old_suffix_len == 0.
@@ -184,11 +182,9 @@ inline size_t invalidate_checkpoints(std::vector<CheckpointLength>& chain, int64
 ///
 /// Phase 2 Task 4 (review-r2 NEW-2): the startup guard (v1.1) refuses q4_0 / hybrid K
 /// (`--kv q4_0` and `--kv k8v4`), the kv-resident slot ring (`--kv-resident > 0`), and
-/// the layer split when the splice flag is on.  Phase 3 (int8 KV splice): `--kv int8` is
-/// NOW SUPPORTED (the daily preset's mode).  The int8 K is dequantized, rotated by the
-/// splice's RoPE delta, and requantized in place (kv_splice_apply_int8.hpp).  Fail-closed:
-/// STRATA_KV_ROT=1 (K through a Hadamard rotation) is still a Phase 3 follow-up and the
-/// runtime hook (kv_splice_apply_session.hpp) refuses it explicitly when the flag is on.
+/// the layer split when the splice flag is on.  Phase 3 relaxed the quant-format gate for
+/// the (since removed) int8 K rotation; the format list is kept as the historical contract
+/// the tests pin.  Fail-closed: unsupported combinations refuse the flag at startup.
 inline std::string validate_suffix_reuse_options(int64_t cache_suffix_reuse, int prompt_cache,
                                                  const std::string& kv_format,
                                                  int64_t kv_resident, bool layer_split_active,
@@ -197,8 +193,8 @@ inline std::string validate_suffix_reuse_options(int64_t cache_suffix_reuse, int
     if (cache_suffix_reuse <= 0) return {};
     if (prompt_cache < 2)
         return "--cache-suffix-reuse N requires --prompt-cache >= 2";
-    // q4_0: ACCEPTED (same as int8/k8v4).  The Q4 helper does the exact H-sandwich with
-    // Q4_0 dequant/requant (suffix_reuse_int8_test T11.f measures the codec noise); falls
+    // Q4_0: ACCEPTED (same as int8/k8v4).  (Historical: the Q4 helper did the exact H-sandwich
+    // with Q4_0 dequant/requant, measured by the since-deleted int8 splice suite); falls
     // through to the kv_resident / layer_split refusals below like every quant format.
     if (kv_format != "fp16" && kv_format != "int8" && kv_format != "k8v4" && kv_format != "q4_0")
         return "--cache-suffix-reuse N requires --kv fp16 or --kv int8 (see plans/2026-10-11_184000-strata-suffix-reuse-phase2-v2.md)";
@@ -292,18 +288,19 @@ inline bool suffix_reuse_should_invalidate(int64_t flag, bool from_live, int64_t
 /// edit_pos=0 on a pure continuation, narrowing `resume` and pessimising the common case).  We
 /// then drop checkpoints with `length > plan.edit_pos` from `chain` and surface the plan.
 ///
-/// Phase 2 Task 1: the outcome also carries the splice plan's fields so the runtime `apply_splice`
-/// in this file can read them.  The names mirror `SuffixReusePlan` (old_suffix_len, new_suffix_len,
-/// deltas, replay_from) so a single struct describes both decisions: which checkpoints to keep and
-/// which K rows to rotate.  Fields are populated on the `fired` path only; at `!fired` the runtime
+/// Phase 2 Task 1: the outcome also carries the splice plan's tail fields so the runtime
+/// can read them.  The names mirror `SuffixReusePlan` (old_suffix_len, new_suffix_len,
+/// deltas, replay_from) so a single struct describes both decisions: which checkpoints to keep
+/// and what the (removed) rotation layer would have consumed.  Fields are populated on the
+/// `fired` path only; at `!fired` the runtime
 /// sees zeros, an empty `deltas`, and the doc says "no splice planned".  This is a pure struct
 /// extension - no behaviour change; the runtime consumer lands in Task 2.
 struct SuffixHookOutcome {
     std::vector<CheckpointLength> chain;   ///< the chain after invalidation (== input when not fired)
     bool fired = false;                     ///< the predicate's verdict (== false -> chain untouched)
     int64_t plan_edit_pos = 0;             ///< Phase 3a T9: the splice hook's narrowing signal (LCP-based, == SuffixReusePlan::narrow_pos).  Where to narrow resume and which checkpoints to keep.
-    int64_t k_rotation_start = 0;          ///< Phase 3a T9: the K rotation start in OLD (suffix-walk-derived, == n_old - old_suffix_len, == SuffixReusePlan::edit_pos).  The unchanged tail from the back - the K rows the splice rotates in place.  For a pure continuation this is 0 (irrelevant; old_suffix_len == 0 gates apply_splice out).
-    // ---- Phase 2 Task 1: splice plan fields surfaced for `apply_splice` (Task 2) ----
+    int64_t k_rotation_start = 0;          ///< Phase 3a T9: the tail start in OLD (suffix-walk-derived, == n_old - old_suffix_len, == SuffixReusePlan::edit_pos).  The unchanged tail from the back.  For a pure continuation this is 0 (irrelevant; old_suffix_len == 0).  Kept: suffix_reuse_partial_apply still fills it.
+    // ---- Phase 2 Task 1: splice plan tail fields (kept: suffix_reuse_partial_apply still fills them) ----
     int64_t old_suffix_len = 0;            ///< common-tail tokens in the OLD prompt (== SuffixReusePlan::old_suffix_len)
     int64_t new_suffix_len = 0;            ///< common-tail tokens in the NEW prompt (== SuffixReusePlan::new_suffix_len)
     std::vector<int64_t> deltas;            ///< per-token position offsets (uniform case: empty, single delta suffices)
@@ -335,7 +332,8 @@ inline SuffixHookOutcome suffix_reuse_apply_invalidation(
     // narrowing signal instead of the suffix-walk-derived `edit_pos`.  For a pure continuation
     // (resume_ck.tokens is a prefix of cur_tokens, LCP == n_old), the plan is a no-op:
     // narrow_pos == n_old == resume (the splice hook's narrowing predicate `narrow_pos < resume`
-    // is false), old_suffix_len == 0 (apply_splice is gated out, no K rotation).  The chain
+    // is false), old_suffix_len == 0 (no tail reuse; the K-rotation splice layer was removed
+    // after review).  The chain
     // drop predicate `length > narrow_pos` drops only the post-resume periodic checkpoints
     // (e.g. 3244 > 3240), exactly the same drops the off-flag canonical erase at
     // generate.cpp:9283-9285 makes - byte-identical.  For a mid-prompt edit at E, LCP = E,
@@ -348,7 +346,7 @@ inline SuffixHookOutcome suffix_reuse_apply_invalidation(
     // `plan.edit_pos` is still surfaced for the T1/T4 backward-compat tests.
     out.plan_edit_pos = plan.narrow_pos;
     out.k_rotation_start = plan.edit_pos;
-    // Phase 2 Task 1: surface the splice plan's fields so the runtime `apply_splice` can read
+    // Phase 2 Task 1: surface the splice plan's tail fields so the runtime can read
     // them straight off the outcome (no second pass over resume_checkpoint_tokens / cur_tokens).
     // Names mirror `SuffixReusePlan` to keep both structs in lockstep (r1 Minor 5: name match).
     out.old_suffix_len = plan.old_suffix_len;
@@ -575,28 +573,6 @@ inline SuffixHookOutcome suffix_reuse_partial_apply(
         else ++i;
     }
     return out;
-}
-
-/// T18 (2026-10-13): the partial mount's read start, replay-gated.  The live
-/// measurement (chain dt-steady5, /tmp/dt-steady5.log) proved that reading
-/// [P, n) on state@checkpoint leaves the gap [ckpt, P) out of the GDN/PLE
-/// recurrence: attention sees the gap's rows through the (valid, LCP-shared)
-/// arena K/V, but the running state never ingested them - a count query over
-/// the gap comes back under-counted (C answered wrong, gap 826 tokens; the
-/// same signature as the v3 state@L probe).  Until FW-2 replay (ring splice /
-/// recurrence replay over the gap) exists, the partial mount fail-closes to
-/// reading from the deepest surviving checkpoint at or below P - byte-equal to
-/// the strict-path semantics - keeping the park/restore/chain bookkeeping
-/// intact and exercised.  `replay_available` is the engine-side gate (env
-/// STRATA_SFX_REPLAY, default off): with it on, the gap-read [P, n) returns.
-/// Pure: the T18 tests pin both arms plus the no-checkpoint degenerate.
-inline int64_t partial_gap_read_from(bool replay_available, int64_t P,
-                                     const std::vector<int64_t>& chain_lengths) {
-    if (replay_available) return P;                 // FW-2: the gap is replayed, read [P, n)
-    int64_t best = 0;                               // fail-closed: read from the checkpoint
-    for (const int64_t L : chain_lengths)
-        if (L <= P && L > best) best = L;
-    return best;
 }
 
 }  // namespace strata::program::suffix_reuse

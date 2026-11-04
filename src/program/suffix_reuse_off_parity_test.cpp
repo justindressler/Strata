@@ -19,10 +19,10 @@
 // prompt edit at E the checkpoints with length > E drop and resume narrows to E.  This test pins
 // both behaviours against the shared helper, not against the runtime integration site.
 //
-// PHASE 2 TASK 2 OFF-PARITY ARM: the splice consumer (`apply_splice`) is reachable only when
+// PHASE 2 TASK 2 OFF-PARITY ARM: the (removed) splice consumer was reachable only when
 // `out.fired == true` AND `out.old_suffix_len > 0`.  At flag=0 (the test's only state), the
-// hook helper returns `fired=false`, which makes `apply_splice` a no-op BEFORE touching K (see
-// `kv_splice_apply.hpp`).  This arm asserts that contract directly by invoking the shared helper
+// hook helper returns `fired=false`, so no reuse decision is made at all.  This arm asserts
+// that contract directly by invoking the shared helper
 // at flag=0 and verifying `fired=false` - the byte-equality proof that the splice consumer is
 // unreachable from any flag=0 path.  Also pins `out.old_suffix_len == 0`, `out.deltas` empty,
 // `out.replay_from == 0`, `out.uniform == false`, `out.delta == 0`.  No QsaState required.
@@ -260,11 +260,11 @@ int main() {
               "F4a: SANITY - the plan via c1 yields edit_pos=100; using checks.front() would be wrong");
     }
 
-    // ---------- Phase 2 Task 2 off-parity arm: splice consumer unreachable at flag=0 ----------
-    // At flag==0 the hook helper returns fired=false (predicate says no splice planned); this
-    // makes `apply_splice` short-circuit at the `!out.fired` check BEFORE touching K (qsa_states,
-    // cos_tab, etc.) - so the byte-equality is preserved at flag=0 by construction.  The fixture
-    // numbers do not change, the hook's outcome carries no splice plan fields, and the runtime
+    // ---------- Phase 2 Task 2 off-parity arm: reuse decisions unreachable at flag=0 ----------
+    // At flag==0 the hook helper returns fired=false (predicate says no splice planned); the
+    // runtime makes no narrowing or checkpoint-drop decision from the hook - so the
+    // byte-equality is preserved at flag=0 by construction.  The fixture
+    // numbers do not change, the hook's outcome carries no plan fields, and the runtime
     // consumer is unreachable.
     {
         std::vector<CheckpointLength> chain = { {100, 0}, {500, 1} };

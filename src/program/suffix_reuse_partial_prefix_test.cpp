@@ -142,12 +142,13 @@ int main() {
         check(outcome.plan_edit_pos != outcome.restore_anchor_length,
               "T12.12: partial case - plan_edit_pos (P) != restore_anchor_length (L) [sentinel]");
 
-        // The K rotation gate at generate.cpp:9089: `if (outcome.old_suffix_len > 0)`.
-        // For this shape, old_suffix_len == 0, so apply_splice is NOT called - no K rotation.
-        // The prefill recomputes K+V for [P, n) anyway.  The K rotation is wasted in this shape.
+        // The K rotation gate (historical, generate.cpp: `if (outcome.old_suffix_len > 0)`).
+        // For this shape, old_suffix_len == 0 - and the rotation layer itself was removed
+        // after review - so cached K is never touched.  The prefill recomputes K+V for
+        // [read_from, n) anyway.
         const bool runtime_would_rotate = outcome.old_suffix_len > 0;
         check(!runtime_would_rotate,
-              "T12.13: runtime does NOT call apply_splice (old_suffix_len == 0)");
+              "T12.13: runtime does NOT touch cached K (old_suffix_len == 0; the rotation layer is gone)");
     }
 
     // ============================================================
@@ -587,25 +588,35 @@ int main() {
     }
 
     // ============================================================
-    // T18: REPLAY-GATED GAP READ (dt-steady5 measured finding)
+    // T18: ALWAYS-FAIL-CLOSED GAP READ (dt-steady5 measured finding)
     // ============================================================
     // Reading [P, n) on state@checkpoint loses the gap [ckpt, P) from the
     // GDN/PLE recurrence: attention sees the gap rows through valid arena K/V,
     // the running state never ingested them (C under-counted; gap 826 tokens).
-    // partial_gap_read_from fail-closes to the checkpoint until FW-2 replay.
+    // The replay gate that once re-enabled the gap-read never shipped - the
+    // splice layer it belonged to was removed after review.  The partial mount
+    // always fail-closes: read_from == restore_length (the deepest checkpoint
+    // restored through); the gap [restore, P) is re-read by the prefill.
     {
-        using strata::program::suffix_reuse::partial_gap_read_from;
+        using strata::program::suffix_reuse::narrowed_resume_target;
         const std::vector<int64_t> chain = { 1574, 2598 };
-        check(partial_gap_read_from(false, 3424, chain) == 2598,
-              "T18.1: replay off -> read from the deepest checkpoint <= P (2598)");
-        check(partial_gap_read_from(true, 3424, chain) == 3424,
-              "T18.2: STRATA_SFX_REPLAY=1 -> the gap-read [P, n) (3424)");
-        check(partial_gap_read_from(false, 3424, {}) == 0,
+        // The runtime override (generate.cpp, T18): read_from = restore_length.
+        const auto fail_closed_read_from = [](int64_t P, const std::vector<int64_t>& lengths) {
+            const auto t = narrowed_resume_target(P, lengths);
+            return t.restore_length;   // read_from == restore_length (always fail-closed)
+        };
+        check(fail_closed_read_from(3424, chain) == 2598,
+              "T18.1: partial mount reads from the deepest checkpoint <= P (2598), never [P, n)");
+        check(fail_closed_read_from(3424, {}) == 0,
               "T18.3: no checkpoint <= P -> fresh read from 0 (fail-closed, never fabricate)");
-        check(partial_gap_read_from(false, 2000, chain) == 1574,
+        check(fail_closed_read_from(2000, chain) == 1574,
               "T18.4: P between anchors -> the deeper-below-P anchor (1574)");
-        check(partial_gap_read_from(true, 3424, {}) == 3424,
-              "T18.5: replay on with an empty chain still reads [P, n) (the runtime restores 0)");
+        {
+            const auto t = narrowed_resume_target(3424, chain);
+            check(t.read_from == 3424 && t.restore_length == 2598,
+                  "T18.2: the helper's raw read_from is P (3424); the runtime override pins it to "
+                  "restore_length (2598) - byte-equal to strict-path semantics");
+        }
     }
 
     // ============================================================
@@ -615,7 +626,7 @@ int main() {
     // live in a SIDE pool (separate from the LRU-capped `checks` list) so they
     // never evict the deep periodic anchors.  The restore pick must take the
     // deepest checkpoint <= P across BOTH pools; fail-close semantics unchanged
-    // (the gap read is the deepest anchor below P; replay is env-gated).
+    // (the gap read is the deepest anchor below P; always fail-closed).
     // Pure seams under test: `narrowed_resume_target_state` (the two-pool pick)
     // and `state_cadence_next` (the fine-cadence ladder, never past n).
     {

@@ -17,7 +17,7 @@ When a mid-prompt edit finds only a partial (LCP) match, mount the unchanged pre
    from "arena re-read" to "parked K/V splice" only when the parked image covers it.
 
 ## Design sketch (T24–T26, TDD)
-- T24 pure seam (suffix_reuse.hpp): `kv_splice_plan(P, anchor, captured_tokens,
+- T24 pure seam (suffix_reuse.hpp): `park_mount_plan(P, anchor, captured_tokens,
   unchanged_tokens, n)` -> {splice_from_parked: [0, min(anchor, unchanged)), read:
   [anchor, n), gap: [min(anchor, unchanged), anchor)}; fail-closed default OFF;
   env gate `STRATA_SFX_KV_SPLICE=1` for the first probes (same pattern as REPLAY).
