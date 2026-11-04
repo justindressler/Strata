@@ -15779,9 +15779,13 @@ int main(int argc, char** argv) {
             // - the CLM bench's mid-file edits hit the parked cache path).
             std::vector<int64_t> sfx_state_lengths;
             sfx_state_lengths.reserve(state_checks.size());
-            for (const ConvCheckpoint& c : state_checks)
-                if (starts_with(c.ids, c.imgs))   // r4 F1: same validity rule as the off_path erase below - a
-                    sfx_state_lengths.push_back((int64_t) c.ids.size());   // non-prefix entry is not a restorable anchor
+            // r4 F-cvec (expert pass 4, part b): state entries were captured under the
+            // session's cached cvec; when this request wants a different one they are not
+            // restorable anchors for it, so the decision must not count them.
+            if (want_cvec == cvec_cached)
+                for (const ConvCheckpoint& c : state_checks)
+                    if (starts_with(c.ids, c.imgs))   // r4 F1: same validity rule as the off_path erase below - a
+                        sfx_state_lengths.push_back((int64_t) c.ids.size());   // non-prefix entry is not a restorable anchor
             const auto parked = conversations.best_with_partial(
                 o.cache_suffix_reuse, ids, req_imgs, want_cvec, sfx_state_lengths,
                 std::max(resume, slot_tokens));   // r4 F2: the anchor must beat the session's flag-off floor
@@ -16061,6 +16065,9 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs)) checks.push_back(c);
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == parked.tokens) { live = c.ids; live_imgs = c.imgs; }
+                // r4 F-cvec (expert pass 4, hygiene mirror): a borrow never partial-mounts,
+                // but keep the state pool consistent with the cvec actually mounted.
+                if (donor->cvec != cvec_cached) state_checks.clear();
                 cvec_cached = donor->cvec;
                 resume = parked.tokens;
                 from_live = false;
@@ -16118,6 +16125,10 @@ int main(int argc, char** argv) {
                     for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
+                // r4 F-cvec (expert pass 4): the state pool is not keyed by cvec; entries
+                // captured under a different control vector must never restore into this
+                // request (wrong running state -> wrong output). Clear on a cvec change.
+                if (incoming->cvec != cvec_cached) state_checks.clear();
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
