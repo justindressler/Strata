@@ -26,19 +26,27 @@ restores the deepest parked checkpoint that is a strict prefix of the new prompt
 edit at position E still mounts everything before the deepest surviving checkpoint. What
 that mount cannot do is cross the edit: every checkpoint past E is invalid, and when edits
 land near the tail (agents rewriting their working notes) the deepest prefix checkpoint is
-shallow against the context length. What this PR adds over upstream is a *denser anchor
-ladder* so the strict mount's restore point sits closer to the edit:
+shallow against the context length. What this PR adds over upstream is a partial-prefix
+mount with a *denser anchor ladder* behind it. The state pool is only consulted when a
+partial mount picks its restore anchor on a PARKED donor — the local strict search and the
+parked strict pass never read it, and extending the ladder into the strict mount is future
+work (§9):
 
 - **Partial-prefix mount** (`--cache-suffix-reuse N`, opt-in): when a parked conversation's
   live image shares a longer prefix with the new prompt than any strict checkpoint does,
-  and the session's state ladder has a restorable anchor deeper than the strict match's,
-  the engine mounts that image and restores the deepest checkpoint at or before the
-  divergence — chosen only when it beats the strict mount (never shallower than flag-off).
+  and the session's state ladder has a restorable anchor deeper than both the strict
+  match and the session's own resume floor, the engine mounts that image and restores the
+  deepest checkpoint at or before the divergence — chosen only when its anchor beats
+  max(strict match, flag-off floor), so it never restores shallower than flag-off.
+  Only a parked LIVE image can partial-mount; a non-live partial would borrow and is
+  skipped (fail-closed, r2 F5).
 - **Dense tail** (`--prompt-cache-dense-tail N`): a position-dependent checkpoint cadence —
   sparse head, full cadence in the last N tokens — so edits that land near the end (most of
   them) have a close anchor on the *next* cold read.
 - **State ladder** (`--prompt-cache-state-every N`): cheap state-only checkpoints at a fine
-  cadence that deepen the restore pick inside the gap the periodic anchors leave.
+  cadence that deepen a partial mount's restore pick inside the gap the periodic anchors
+  leave. The pool is read only by a partial mount on a parked donor; the strict mount —
+  local or parked — never consults it (extending it there is future work, §9).
 
 The feature family is opt-in, fails closed to the exact pre-feature re-read behavior, and
 the default path is unchanged (pinned by `suffix_reuse_off_parity_test`).
@@ -135,10 +143,12 @@ at P):
   text; only the appended tokens are read.
 - **Identical re-send: 0.7 s.** Pure cache, nothing read.
 - *(These three are the checkpoint mount working — upstream behaviour.)*
-- **Mid-file edit: a re-read from the deepest checkpoint at/before the edit.** With the
-  state ladder at 256 the bound is one ladder step — *when the state pool holds a checkpoint
-  at that depth*; at very long contexts it may hold none (§9) and the bound falls back to
-  the periodic-anchor spacing.
+- **Mid-file edit: a re-read from the deepest checkpoint at/before the edit.** When a
+  parked donor partial-mounts and the state ladder is at 256, the bound is one ladder
+  step — *and only then when the state pool holds a checkpoint at that depth*; with no
+  parked donor (editing the live conversation) the ladder is not read at all, and at
+  very long contexts the pool may hold nothing (§9), so the bound falls back to the
+  periodic-anchor spacing.
 - **Ladder-specific numbers: withdrawn.** Earlier drafts credited the state ladder with a
   "2.1× mean reuse" gain and ContextBench family improvements (log-triage 21.5% → 77.2%,
   kv-store 43.1% → 72.3%). Those measurements predate the fix of a byte-cap comparison bug
@@ -182,7 +192,6 @@ Refused at startup by the validator (the request never starts): `--kv-resident >
   after every commit.
 - The three splice-only suites (`suffix_reuse_apply_test`, `suffix_reuse_int8_test`,
   `suffix_reuse_device_test`) tested the removed rotation layer and were deleted with it.
-- Off-parity (reuse off vs on, identical output) is asserted by test, not inspection.
 
 ## 9. Limitations and future work
 
