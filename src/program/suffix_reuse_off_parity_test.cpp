@@ -20,12 +20,14 @@
 // both behaviours against the shared helper, not against the runtime integration site.
 //
 // PHASE 2 TASK 2 OFF-PARITY ARM: the (removed) splice consumer was reachable only when
-// `out.fired == true` AND `out.old_suffix_len > 0`.  At flag=0 (the test's only state), the
-// hook helper returns `fired=false`, so no reuse decision is made at all.  This arm asserts
-// that contract directly by invoking the shared helper
-// at flag=0 and verifying `fired=false` - the byte-equality proof that the splice consumer is
-// unreachable from any flag=0 path.  Also pins `out.old_suffix_len == 0`, `out.deltas` empty,
-// `out.replay_from == 0`, `out.uniform == false`, `out.delta == 0`.  No QsaState required.
+// `out.fired == true`.  At flag=0 (the test's only state), the hook helper returns
+// `fired=false`, so no reuse decision is made at all.  This arm asserts that contract
+// directly by invoking the shared helper at flag=0 and verifying `fired=false`, an
+// untouched chain, and `replay_from == 0` - the byte-equality proof that the splice
+// consumer is unreachable from any flag=0 path.  (r2 F7: the dead tail fields
+// old_suffix_len/new_suffix_len/deltas/uniform/delta were deleted from the outcome;
+// the plan-level tail arithmetic stays pinned by suffix_reuse_test via
+// compute_suffix_plan.)  No QsaState required.
 #include "strata/core/conversation_cache.hpp"
 #include "strata/program/suffix_reuse.hpp"
 
@@ -148,9 +150,9 @@ int main() {
     // (cur[4..8) = 99s) with the LAST token preserved so a suffix of length 1 survives; the
     // helper's `narrow_pos` (Phase 3a T9, LCP-based = the splice hook's narrowing signal) is 4
     // (the first index of divergence from the front) and the chain drops any checkpoint with
-    // length > narrow_pos = 4 (drops 5 and 9, keeps 2).  The suffix-derived `k_rotation_start`
-    // (legacy, == n_old - suffix_len) is 8 - the start of the unchanged tail in OLD that the
-    // splice's K rotation covers.
+    // length > narrow_pos = 4 (drops 5 and 9, keeps 2).  (r2 F7: the suffix-derived tail
+    // start the removed rotation layer consumed is pinned on the PLAN via
+    // compute_suffix_plan - the outcome no longer carries tail fields.)
     {
         std::vector<CheckpointLength> chain = { {2, 0}, {5, 1}, {9, 2} };
         std::vector<int32_t> resume_tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9};
@@ -169,8 +171,8 @@ int main() {
         check(outcome.fired, "F1: helper fires when flag>0 and controls satisfied (cur_size > resume)");
         check(outcome.plan_edit_pos == 4,
               "F1: helper's plan_edit_pos == narrow_pos == 4 (LCP-based, the first index of divergence)");
-        check(outcome.k_rotation_start == 8,
-              "F1: helper's k_rotation_start == suffix-derived edit_pos == 8 (start of unchanged tail in OLD)");
+        check(compute_suffix_plan(resume_tokens, cur_tokens).edit_pos == 8,
+              "F1: the plan's suffix-derived edit_pos == 8 (start of unchanged tail in OLD; on the plan, r2 F7)");
         check(outcome.chain.size() == 1 && outcome.chain[0].length == 2,
               "F1: helper's chain drops lengths > narrow_pos=4 (5 and 9 dropped, 2 survives)");
     }
@@ -282,10 +284,8 @@ int main() {
               "P2 off-parity: flag==0 -> helper returns fired=false (splice consumer unreachable)");
         check(outcome_off.plan_edit_pos == 0,
               "P2 off-parity: flag==0 -> plan_edit_pos stays 0 (no plan emitted)");
-        check(outcome_off.old_suffix_len == 0 && outcome_off.new_suffix_len == 0,
-              "P2 off-parity: flag==0 -> splice plan's tail lengths are 0");
-        check(outcome_off.deltas.empty() && !outcome_off.uniform && outcome_off.delta == 0,
-              "P2 off-parity: flag==0 -> splice plan's rotation fields are zero/no-uniform");
+        check(outcome_off.chain.size() == chain.size(),
+              "P2 off-parity: flag==0 -> chain untouched (no invalidation, no narrowing)");
         check(outcome_off.replay_from == 0,
               "P2 off-parity: flag==0 -> replay_from stays 0 (no linear-state replay planned)");
         // Byte-equality: the fixture numbers are the same with the off-parity hook path because

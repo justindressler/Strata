@@ -34,29 +34,20 @@
 // The T9 assertions `edit_pos == 3240` and `old_suffix_len == 0` FAIL.
 //
 // ============================================================
-// T10 - anchor-splice engagement (the splice's savings discarded)
+// T10 - anchor engagement (the wiring of the chunk loop's read start)
 // ============================================================
 //
-// THE BUG.  Phase-2 wiring (431fc2c + ce20ef3): `narrowed_resume_target()` returns
-// (restore_length, read_from) but generate.cpp only consumes `t.restore_length` at line 9339.
-// The chunk loop's `read_from` at line 9394 is `reread_to > 0 ? 0 : resume`, so when the splice
-// narrowed `resume` to `t.restore_length` (the anchor C, e.g. 2000), the chunk loop re-reads
-// from C onward - including the rotated region [C, E) the splice just set up, and more
-// importantly [E, n) gets a fresh prefill that OVERWRITES the splice's K rotation.  GLM review
-// MAJOR-1 documented this: the rotation is technically wasted (prefill recomputes K), but the
-// bigger issue is that the `read_from` is wrong - the chunk loop should re-read ONLY [E, n),
-// not [C, n), so the [C, E) gap is covered by the anchor restore (no re-read) and the [E, n)
-// re-read is the splice's saved work.
+// HISTORY.  Phase-2 wiring (431fc2c + ce20ef3) consumed only `t.restore_length` and the
+// chunk loop read from `resume`.  Phase 3a wired `wire_splice_read_from` so the narrowed
+// target's `read_from` is honoured.  The r2 review (finding 4) then moved the fail-closed
+// contract INTO the helper: `read_from == restore_length` always - the chunk loop starts
+// reading at the position the restored state describes, so the gap between the restored
+// checkpoint and the edit position is re-read by the prefill, never skipped (reading
+// [edit, n) on the restored state loses the gap from the GDN/PLE recurrence - T18).
 //
-// THE FIX.  When `splice_narrowed` is true, the chunk loop's `read_from` must be
-// `t.read_from` (= the splice-narrowed resume = edit_pos E), not `resume` (= the restored
-// anchor C).  The wiring lives at generate.cpp:9394.  The pure helper `wire_splice_read_from`
-// in this header captures the resolution so the test pins it.
-//
-// RED ON THE PRE-FIX STATE (ce20ef3): the runtime at line 9394 uses `resume` (= t.restore_length
-// = 2000) for `read_from`.  The T10 assertion `read_from == 2500` (the splice-narrowed value)
-// FAILS; the runtime would re-read [2000, n) instead of [2500, n), missing the gap-read and
-// over-reading 500 tokens of content already covered by the anchor restore.
+// WHAT THIS TEST PINS.  When `splice_narrowed` is true, the chunk loop's `read_from` is
+// `t.read_from` (== restore_length), not `resume`; the pure helper `wire_splice_read_from`
+// in the header captures the resolution so the test pins it without GPU.
 //
 // ============================================================
 //
@@ -79,22 +70,23 @@
 //          is byte-identical to T9.1's on-arm no-op (mount survives)
 //
 //   T10.1 ANCHOR-SPLICE (checks={2000, 3240, 3244}, edit E=2500):
-//          compute_suffix_plan -> edit_pos == 2500, old_suffix_len == 790 (the unchanged tail)
+//          compute_suffix_plan -> narrow_pos == 2500 (LCP), old_suffix_len == 790 (the plan's
+//          unchanged tail - pinned on the plan; the outcome no longer carries tail fields)
 //          outcome.fired == true
 //          outcome.plan_edit_pos == 2500
 //          outcome.chain keeps {2000} only (3240, 3244 dropped by `length > 2500`)
-//          narrowed_resume_target(2500, {2000}) -> restore_length == 2000, read_from == 2500
-//          wire_splice_read_from(true, t, resume=2000, reread_to=-1) -> 2500
+//          narrowed_resume_target(2500, {2000}) -> restore_length == 2000, read_from == 2000
+//                                                 (r2 F4: read_from == restore_length)
+//          wire_splice_read_from(true, t, resume=2000, reread_to=-1) -> 2000
 //          wire_splice_read_from(false, t, resume=2000, reread_to=-1) -> 2000 (legacy path)
 //
 //   T10.2 NO ANCHOR (checks={3240, 3244} - the live 431fc2c+ce20ef3 shape; no candidate at/
 //          below the edit pos): helper returns restore_length == 0, read_from == 0; wiring
 //          degrades to fresh prefill from 0 (no error, no fabricated checkpoint).
 //
-//   T10.3 NO RE-READ OF ROTATED REGION: when splice_narrowed and t.read_from = 2500, the
-//          chunk loop's read_from is 2500, not t.restore_length (2000).  The 500-token gap
-//          [2000, 2500) is covered by the anchor restore (no re-read), and [2500, n) is the
-//          gap-read (the splice's saved work).
+//   T10.3 FAIL-CLOSED: when splice_narrowed, the chunk loop's read_from is t.read_from
+//          (== restore_length): the gap [restore, edit) is re-read by the prefill - never
+//          skipped - and [edit, n) follows, byte-equal to the strict path's semantics.
 
 #include "strata/program/suffix_reuse.hpp"
 
@@ -191,23 +183,22 @@ int main() {
               "T9.1 LIVE: hook fires (flag=64, controls met) - the runtime decides no-op from the plan");
         check(outcome.plan_edit_pos == 3240,
               "T9.1 LIVE: outcome.plan_edit_pos == 3240 (= resume; runtime does NOT narrow)");
-        check(outcome.old_suffix_len == 0,
-              "T9.1 LIVE: outcome.old_suffix_len == 0 (the removed rotation layer was gated on >0; no K was touched)");
+        check(outcome.replay_from == 3240,
+              "T9.1 LIVE: outcome.replay_from == 3240 (== narrow_pos; no replay position before the mount)");
         check(outcome.chain.size() == 1 && outcome.chain[0].length == 3240,
               "T9.1 LIVE: chain drops 3244 (length > edit_pos 3240), keeps resume ckpt at 3240 (1 survivor)");
 
-        // The runtime narrowing predicate at generate.cpp:9073: `if (outcome.plan_edit_pos < resume)`.
+        // The runtime narrowing predicate (historical, generate.cpp: `if (outcome.plan_edit_pos < resume)`).
         // For continuation, edit_pos == resume, so the predicate is false -> no narrowing.
+        // (The strict-path hook itself was deleted in r2 F1 - resume always comes from a
+        // checkpoint that is a prefix of the new prompt, so it can never usefully narrow.)
         const bool runtime_would_narrow = outcome.plan_edit_pos < 3240;
         check(!runtime_would_narrow,
               "T9.1 LIVE: runtime does NOT narrow resume (edit_pos == resume; mount survives)");
 
-        // The runtime rotation gate (historical, generate.cpp: `if (outcome.old_suffix_len > 0)`).
-        // For continuation, old_suffix_len == 0 - and the rotation layer itself was removed
-        // after review - so K is never touched on this path.
-        const bool runtime_would_rotate = outcome.old_suffix_len > 0;
-        check(!runtime_would_rotate,
-              "T9.1 LIVE: runtime does NOT touch cached K (old_suffix_len == 0; the rotation layer is gone)");
+        // The (removed) rotation layer was gated on the plan's old_suffix_len; the plan's
+        // value is pinned above (0 - the continuation special case).  With the layer gone
+        // and its outcome fields deleted (r2 F7), there is nothing further to gate.
 
         // The runtime erasure at generate.cpp:9045-9055: drops `length > plan_edit_pos` from
         // `outcome.chain`.  For continuation, the drop predicate is `length > 3240`; 3240 is
@@ -240,8 +231,8 @@ int main() {
         std::vector<CheckpointLength> chain = { {3240, 0}, {3244, 1} };
         const SuffixHookOutcome outcome = suffix_reuse_apply_invalidation(
             64, false, 3240, chain, resume_ck, cur);
-        check(outcome.plan_edit_pos == 3240 && outcome.old_suffix_len == 0,
-              "T9.2 LIVE-no-EOS: outcome no-op (edit_pos==resume, old_suffix_len==0)");
+        check(outcome.plan_edit_pos == 3240 && outcome.replay_from == 3240,
+              "T9.2 LIVE-no-EOS: outcome no-op (edit_pos==resume, replay_from==resume)");
         check(outcome.chain.size() == 1 && outcome.chain[0].length == 3240,
               "T9.2 LIVE-no-EOS: chain drops 3244 (length > edit_pos 3240), keeps resume ckpt at 3240");
 
@@ -319,21 +310,24 @@ int main() {
         check(runtime_would_narrow,
               "T10.1 ANCHOR: runtime narrows resume to 2500 (real edit; mount must use anchor)");
 
-        // narrowed_resume_target(2500, {2000}) -> restore=2000 (deepest <= 2500), read_from=2500.
+        // narrowed_resume_target(2500, {2000}) -> restore=2000 (deepest <= 2500),
+        // read_from=2000 (r2 F4: read_from == restore_length - the chunk loop starts
+        // AT the restored checkpoint; the [2000, 2500) gap is re-read by the prefill,
+        // never skipped).
         const std::vector<int64_t> chain_lengths = {2000};
         const NarrowedResumeTarget t = narrowed_resume_target(2500, chain_lengths);
         check(t.restore_length == 2000,
               "T10.1 ANCHOR: t.restore_length == 2000 (the anchor C; restored through)");
-        check(t.read_from == 2500,
-              "T10.1 ANCHOR: t.read_from == 2500 (the edit pos E; the gap-read start)");
+        check(t.read_from == 2000,
+              "T10.1 ANCHOR: t.read_from == 2000 (== restore_length; fail-closed, the gap [2000, 2500) is re-read)");
 
-        // The wiring: chunk loop's read_from should be t.read_from (2500) when splice_narrowed,
-        // not resume=t.restore_length (2000).  The runtime at generate.cpp:9394 is the site.
-        // The header's wire_splice_read_from captures the resolution.
+        // The wiring: when splice_narrowed the chunk loop's read_from is t.read_from
+        // (== restore_length, fail-closed), not `resume`.  The header's
+        // wire_splice_read_from captures the resolution.
         const int64_t read_from_spliced = wire_splice_read_from(
             /*splice_narrowed=*/true, t, /*resume=*/2000, /*reread_to=*/-1);
-        check(read_from_spliced == 2500,
-              "T10.1 ANCHOR: wire_splice_read_from(true, t, 2000, -1) == 2500 (NOT 2000; the fix)");
+        check(read_from_spliced == 2000,
+              "T10.1 ANCHOR: wire_splice_read_from(true, t, 2000, -1) == 2000 (t.read_from == restore_length)");
         const int64_t read_from_legacy = wire_splice_read_from(
             /*splice_narrowed=*/false, t, /*resume=*/2000, /*reread_to=*/-1);
         check(read_from_legacy == 2000,
@@ -351,11 +345,12 @@ int main() {
         check(read_from_spliced_reread == 0,
               "T10.1 ANCHOR: wire_splice_read_from(true, t, 2000, reread_to=2000) == 0 (reread wins)");
 
-        // The rotated region is NOT re-read: [2000, 2500) is covered by the anchor restore
-        // (no chunk-loop work) and [2500, n) is the gap-read.  Total re-read = n - 2500.
+        // The re-read region is [read_from, n) = [2000, 3294): the restored anchor C
+        // covers [0, 2000) and the prefill re-reads the gap [2000, 2500) plus the edited
+        // tail [2500, n) - fail-closed, byte-equal to the strict path's semantics.
         const int64_t total_reread = 3294 - read_from_spliced;
-        check(total_reread == 794,
-              "T10.1 ANCHOR: chunk loop re-reads 794 tokens [2500, 3294), NOT 1294 [2000, 3294)");
+        check(total_reread == 1294,
+              "T10.1 ANCHOR: chunk loop re-reads 1294 tokens [2000, 3294) (restore_length, not the edit pos)");
     }
 
     // ---- T10.2 NO ANCHOR (checks={3240, 3244}; the live 431fc2c+ce20ef3 shape) ----

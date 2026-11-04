@@ -103,7 +103,10 @@ int main() {
               "T12 setup: strict best() returns no match for partial-prefix shape");
 
         // best_with_partial(flag=64, ...): partial match, LCP=2, ckpt length=4.
-        const auto m = cache.best_with_partial(64, prompt, {}, true);
+        // The session's state pool (r2 F3) supplies the restorable anchor at 2 <= P -
+        // without an anchor deeper than the strict s (0 here) the partial is not chosen.
+        const std::vector<int64_t> state_pool = {2};
+        const auto m = cache.best_with_partial(64, prompt, {}, true, state_pool);
         check(m.partial,
               "T12.1: best_with_partial(flag>0) returns partial=true for {A B C D} / {A B X Y}");
         check(m.tokens == 2,
@@ -112,6 +115,11 @@ int main() {
               "T12.3: match.checkpoint_length == 4 (the full checkpoint's length)");
         check(m.tokens < m.checkpoint_length,
               "T12.4: LCP < checkpoint_length (the partial-mount invariant)");
+        // r2 F3: with NO state anchor deeper than s the partial is refused - the donor's
+        // periodic checkpoints at or before P are prefixes the strict pass already sees.
+        const auto m_nostate = cache.best_with_partial(64, prompt, {}, true);
+        check(!m_nostate.partial && m_nostate.tokens == 0,
+              "T12.4b: no state anchor -> strict stands (s=0); partial never chosen (r2 F3)");
 
         // The partial helper: fire, plan, anchor.
         const std::vector<int32_t> ck_tokens = {1, 2, 3, 4};
@@ -124,12 +132,14 @@ int main() {
               "T12.6: outcome.plan_edit_pos == 2 (the LCP)");
         check(outcome.restore_anchor_length == 4,
               "T12.7: outcome.restore_anchor_length == 4 (the partial-mount anchor)");
-        check(outcome.old_suffix_len == 0,
-              "T12.8: outcome.old_suffix_len == 0 ([C D] vs [X Y] - no common tail)");
-        check(outcome.new_suffix_len == 0,
-              "T12.9: outcome.new_suffix_len == 0 (no common tail)");
-        check(!outcome.uniform,
-              "T12.10: outcome.uniform == false (no deltas to compute; gate is on old_suffix_len > 0)");
+        // The tail fields live on the PLAN (r2 F7 deleted the outcome's dead copies).
+        const auto plan = compute_suffix_plan(ck_tokens, prompt);
+        check(plan.old_suffix_len == 0,
+              "T12.8: plan.old_suffix_len == 0 ([C D] vs [X Y] - no common tail)");
+        check(plan.new_suffix_len == 0,
+              "T12.9: plan.new_suffix_len == 0 (no common tail)");
+        check(!plan.uniform,
+              "T12.10: plan.uniform == false (no deltas to compute)");
         check(outcome.chain.size() == 1 && outcome.chain[0].length == 4,
               "T12.11: chain keeps the anchor (length 4 == L); non-anchor entries with length > P are dropped");
 
@@ -142,22 +152,18 @@ int main() {
         check(outcome.plan_edit_pos != outcome.restore_anchor_length,
               "T12.12: partial case - plan_edit_pos (P) != restore_anchor_length (L) [sentinel]");
 
-        // The K rotation gate (historical, generate.cpp: `if (outcome.old_suffix_len > 0)`).
-        // For this shape, old_suffix_len == 0 - and the rotation layer itself was removed
-        // after review - so cached K is never touched.  The prefill recomputes K+V for
-        // [read_from, n) anyway.
-        const bool runtime_would_rotate = outcome.old_suffix_len > 0;
-        check(!runtime_would_rotate,
-              "T12.13: runtime does NOT touch cached K (old_suffix_len == 0; the rotation layer is gone)");
+        // The (removed) K-rotation layer was historically gated on the plan's
+        // old_suffix_len; the layer and its outcome fields are gone (r2 F7) - the
+        // prefill recomputes K+V for [read_from, n) anyway.
     }
 
     // ============================================================
-    // T12 variant: partial match WITH a common tail (K rotation engages - pure insert of 1)
+    // T12 variant: partial match WITH a common tail (a pure insert of 1; the tail fields
+    // are pinned on the PLAN - the outcome no longer carries them, r2 F7)
     // ============================================================
     // OLD = {A B C D E} (length 5), NEW = {A B X C D E} (length 6 - pure insert at position 2).
     // LCP = 2 (A, B match; index 2 diverges: C vs X).
     // Common tail from back: [C, D, E] vs [C, D, E] -> 3.
-    // The K rotation rotates K rows at OLD positions 2, 3, 4 to NEW positions 3, 4, 5 (delta=+1).
     {
         const std::vector<int32_t> ck_tokens = {1, 2, 3, 4, 5};     // OLD: [A B C D E]
         const std::vector<int32_t> prompt    = {1, 2, 90, 3, 4, 5}; // NEW: [A B X C D E]
@@ -167,15 +173,16 @@ int main() {
         check(outcome.fired, "T12v.1: partial_apply fired (LCP=2, suffix=3)");
         check(outcome.plan_edit_pos == 2, "T12v.2: plan_edit_pos == 2 (LCP)");
         check(outcome.restore_anchor_length == 5, "T12v.3: restore_anchor_length == 5 (anchor)");
-        check(outcome.old_suffix_len == 3,
-              "T12v.4: old_suffix_len == 3 ([C D E] common tail in OLD)");
-        check(outcome.new_suffix_len == 3,
-              "T12v.5: new_suffix_len == 3 ([C D E] common tail in NEW)");
-        check(outcome.uniform,
-              "T12v.6: uniform == true (pure insert of 1, all deltas == +1)");
-        check(outcome.delta == 1,
-              "T12v.7: delta == +1 (insert of X shifts C,D,E from OLD [2,4) to NEW [3,5))");
-        check(outcome.deltas.empty(),
+        const auto plan = compute_suffix_plan(ck_tokens, prompt);
+        check(plan.old_suffix_len == 3,
+              "T12v.4: plan.old_suffix_len == 3 ([C D E] common tail in OLD)");
+        check(plan.new_suffix_len == 3,
+              "T12v.5: plan.new_suffix_len == 3 ([C D E] common tail in NEW)");
+        check(plan.uniform,
+              "T12v.6: plan.uniform == true (pure insert of 1, all deltas == +1)");
+        check(plan.delta == 1,
+              "T12v.7: plan.delta == +1 (insert of X shifts C,D,E from OLD [2,4) to NEW [3,5))");
+        check(plan.deltas.empty(),
               "T12v.8: uniform -> deltas table empty (single rotation suffices)");
     }
 
@@ -192,8 +199,9 @@ int main() {
         std::vector<CheckpointLength> chain;
         const SuffixHookOutcome outcome = suffix_reuse_partial_apply(
             ck_tokens, prompt, /*L=*/6, /*P=*/2, chain);
-        check(outcome.fired && outcome.uniform && outcome.delta == 2,
-              "T12v2.1: pure insert of 2 -> delta=+2");
+        const auto plan = compute_suffix_plan(ck_tokens, prompt);
+        check(outcome.fired && plan.uniform && plan.delta == 2,
+              "T12v2.1: pure insert of 2 -> delta=+2 (on the plan; r2 F7)");
     }
 
     // ============================================================
@@ -238,72 +246,64 @@ int main() {
     }
 
     // ============================================================
-    // T14: BEST-OF-N (longest LCP wins; strict > partial)
+    // T14: BEST-OF-N (the r2 F3/F5 selection rules)
     // ============================================================
     {
         // Three checkpoints with different LCPs against prompt {A B X Y}:
         //   ck A: {A B C D}     -> LCP = 2, depth = 4
         //   ck B: {A B C D E F} -> LCP = 2, depth = 6  (longer, same LCP - prefer deeper)
-        //   ck C: {A B}         -> strict prefix (length 2) - PREFERRED OVER PARTIAL
-        // Expected: best_with_partial returns ck C (strict match at 2, beats any partial).
+        //   ck C: {A B}         -> strict prefix (length 2) - the strict anchor, s = 2
+        // r2 F5: the partial candidate (deepest donor checkpoint 6 > P = 2) BORROWS - a
+        // borrowing partial is never eligible (the borrow path mounts a checkpoint at
+        // exactly P and there is none).  The strict match at 2 stands.
         auto s = image({});
         s.checkpoints = {ckpt({1, 2, 3, 4}), ckpt({1, 2, 3, 4, 5, 6}), ckpt({1, 2})};
         ConversationCache cache(1 << 20, 4);
         cache.put(std::move(s));
 
-        // T14 under the FW-1 splice-engagement contract (2026-10-13): the OLD
-        // pin was "strict > partial always".  The dominance rule replaces it:
-        // partial is chosen when its anchor covers strictly more (L > s) and it
-        // never reads shallower (p >= s).  Here ck C {A B} is strict at s=2;
-        // ck A {A B C D} has LCP p=2 == s and L=4 > s -> partial WINS, reading
-        // from the same point 2 the strict match would, with a deeper anchor
-        // (the splice branch decides downstream whether the tail is recoverable;
-        // this prompt's tail {C D} vs {X Y} has no common suffix, so it degrades
-        // to the same gap-read the strict match would do - never worse).
         const std::vector<int32_t> prompt = {1, 2, 90, 91};   // [A B X Y]
         const auto m = cache.best_with_partial(64, prompt, {}, true);
-        check(m.partial,
-              "T14.1: deeper partial (L=4) beats equal-depth strict (s=2, p=2) - splice engagement");
+        check(!m.partial && m.tokens == 2,
+              "T14.1: borrowing partial (P=2 below donor's deepest 6) is skipped; strict s=2 stands (r2 F5)");
         check(m.tokens == 2,
-              "T14.2: reads from the LCP (2) - same point as the strict match, never shallower");
-        check(m.checkpoint_length == 6,
-              "T14.3: the deepest checkpoint (6) is the anchor - T17 lifted the size guard, so the "
-              "6-long entry (LCP 2, previously size-refused) wins the deeper-anchor tie-break over 4");
+              "T14.2: the strict anchor reads from 2 - never shallower, never stale");
 
-        // Now drop ck C and re-test: partial mode, longest LCP wins, deeper anchor wins ties.
-        // Use a prompt long enough for both checkpoints to be partial (L <= n).
-        auto s2 = image({});
-        s2.checkpoints = {ckpt({1, 2, 3, 4}), ckpt({1, 2, 3, 4, 5, 6})};
+        // r2 F3 cross-check: the partial is not rescued by a deep state pool either -
+        // the F5 borrow skip comes first (documented choice: never borrow a partial).
+        const auto m_state = cache.best_with_partial(64, prompt, {}, true, {3});
+        check(!m_state.partial && m_state.tokens == 2,
+              "T14.3: F5 first: even with a state anchor at 3, a borrowing partial never mounts");
+
+        // Live-anchor shape (NOT a borrow): parked live {A B C D E F}, a strict anchor
+        // {A B} (s=2), prompt {A B C X} so the live's LCP P=3 > s; a state anchor at 3
+        // (<= P, > s) -> the partial wins (its deepest restorable anchor 3 beats s 2, r2 F3).
+        auto s2 = image({1, 2, 3, 4, 5, 6});
+        s2.checkpoints = {ckpt({1, 2})};
         ConversationCache cache2(1 << 20, 4);
         cache2.put(std::move(s2));
-        const std::vector<int32_t> prompt_long = {1, 2, 90, 91, 92, 93, 94, 95};  // length 8
-        const auto m2 = cache2.best_with_partial(64, prompt_long, {}, true);
+        const std::vector<int32_t> prompt_p3 = {1, 2, 3, 90};   // [A B C X]: live LCP 3, strict s 2
+        const auto m2 = cache2.best_with_partial(64, prompt_p3, {}, true, {3});
         check(m2.partial,
-              "T14.4: no strict match -> partial mode engages");
-        check(m2.tokens == 2 && m2.checkpoint_length == 6,
-              "T14.5: deepest anchor wins ties (ck B {1..6} beats ck A {1..4} at LCP=2)");
+              "T14.4: live-anchor partial engages when its state anchor (3) beats strict s (2)");
+        check(m2.tokens == 3 && m2.checkpoint_length == 6 && m2.live,
+              "T14.5: LCP=3 (> s), anchor L=6, live=true - reads never shallower than the strict 2");
+        // ...and is refused without the state anchor: the donor's own periodic anchors at
+        // or before P are exactly the strict pass's candidates (equal, never deeper).
+        const auto m2b = cache2.best_with_partial(64, prompt_p3, {}, true);
+        check(!m2b.partial && m2b.tokens == 2,
+              "T14.5b: same shape, no state anchor -> strict stands (r2 F3)");
 
-        // Three checkpoints with different LCPs: longest LCP wins.
+        // Longest LCP wins between two live-anchor candidates.
         auto s3 = image({});
         s3.checkpoints = {ckpt({1, 2, 3, 4}), ckpt({1, 2, 30, 31, 32})};
         ConversationCache cache3(1 << 20, 4);
         cache3.put(std::move(s3));
         const std::vector<int32_t> prompt2 = {1, 2, 3, 90, 91, 92};   // matches ck A for 3 tokens, ck B for 2
-        const auto m3 = cache3.best_with_partial(64, prompt2, {}, true);
-        check(m3.partial && m3.tokens == 3 && m3.checkpoint_length == 4,
-              "T14.6: longest LCP wins (3 > 2, ck A {1..4} at LCP=3 over ck B at LCP=2)");
-
-        // Live state beats checkpoints of the same length (the existing best() tie-break).  Use a
-        // prompt long enough for both the live (length 6) and the checkpoint (length 4) to be
-        // partial candidates.
-        auto s4 = image({1, 2, 3, 4, 5, 6});
-        s4.checkpoints = {ckpt({1, 2, 3, 4})};
-        ConversationCache cache4(1 << 20, 4);
-        cache4.put(std::move(s4));
-        const std::vector<int32_t> prompt_live = {1, 2, 90, 91, 92, 93, 94, 95};  // length 8
-        const auto m4 = cache4.best_with_partial(64, prompt_live, {}, true);
-        check(m4.partial && m4.tokens == 2 && m4.checkpoint_length == 6 && m4.live,
-              "T14.7: live state matches at LCP=2 (deeper anchor); live=true");
+        // Both candidates are non-live partials whose donor has a deeper checkpoint ->
+        // F5 skips them; the (empty) strict match stands.
+        const auto m3 = cache3.best_with_partial(64, prompt2, {}, true, {3});
+        check(!m3.partial && m3.tokens == 0,
+              "T14.6: borrowing partials skipped regardless of LCP (r2 F5); strict 0 stands");
     }
 
     // ============================================================
@@ -421,26 +421,22 @@ int main() {
     }
 
     // ============================================================
-    // T16: SPLICE ENGAGEMENT - a deeper partial beats a shallower strict
+    // T16: SPLICE-ENGAGEMENT REVISITED (the r2 F3 dominance rule)
     // ============================================================
-    // The M1 steady-state finding (2026-10-13): best_with_partial returns at the
-    // FIRST strict match and never evaluates partial, so when the checkpoints hold
-    // both a strict anchor s (s <= D, the divergence point) and a DEEPER checkpoint
-    // L > D that would splice, the strict one wins and the splice never engages
-    // ([SFX-DBG] partial-branch enter=0 in every steady trace).
-    //
-    // Dominance rule (safe because one conversation's checkpoints are nested
-    // prefixes of ONE history: the history diverges from the request at a single
-    // point D, so every strict anchor s <= D = the partial LCP p - a partial mount
-    // never reads from a shallower point, and its splice may recover up to L):
-    // prefer the partial match when its checkpoint covers strictly more than the
-    // strict anchor (L > s); otherwise keep strict (no splice cost when it cannot
-    // recover more).
+    // The M1 steady-state finding (2026-10-13) made best_with_partial prefer a
+    // deeper partial over a shallower strict anchor on "L > s" alone.  The r2 review
+    // (finding 3) showed that with the splice gone this can pick a WORSE restore
+    // point than flag-off: reads start at the restored anchor, and a donor's
+    // periodic checkpoints at or before P are prefixes the strict pass already
+    // sees.  The rule now: the partial is chosen only when its deepest restorable
+    // anchor at or before P - across the donor's periodic checks AND the session's
+    // state pool - is DEEPER than the strict match's s.  Otherwise the strict
+    // mount wins (never shallower than flag-off).
     {
-        // One conversation: checkpoints {A B} (2, the future strict anchor) and
-        // {A B C D E} (5, crosses the edit).  Request {A B C X E ...}: history
+        // One conversation: checkpoints {A B} (2, the strict anchor) and
+        // {A B C D E} (5, crosses the edit).  Request {A B C X E}: history
         // diverges at D=3 (C vs X at index 3).  Strict anchor {A B} mounts 2;
-        // partial on {A B C D E}: LCP=3, L=5 -> splice recovers [P=3, L=5) tail E.
+        // partial on the live {A B C D E}: LCP=3, L=5.
         auto s = image({1, 2, 3, 4, 5});
         s.checkpoints = { ckpt({1, 2}), ckpt({1, 2, 3, 4, 5}) };
         ConversationCache cache(1 << 20, 4);
@@ -451,55 +447,60 @@ int main() {
         check(strict.tokens == 2 && !strict.partial,
               "T16.1: strict best() mounts the {A B} anchor (2)");
 
-        const auto m = cache.best_with_partial(64, prompt, {}, true);
-        check(m.partial,
-              "T16.2: partial preferred over shallower strict (splice engagement)");
-        check(m.tokens == 3,
-              "T16.3: partial LCP == 3 (== the strict anchor's 2... history diverges at 3)");
-        check(m.checkpoint_length == 5,
-              "T16.4: the deeper checkpoint (5) is the splice anchor");
+        // Without a state anchor the partial is NOT chosen: its deepest restorable
+        // anchor <= P=3 is the donor's {A B} (2) - exactly the strict anchor.  Equal,
+        // never deeper: the partial would restore at 2 like the strict mount, at the
+        // cost of taking and restoring the whole donor image.
+        const auto m0state = cache.best_with_partial(64, prompt, {}, true);
+        check(!m0state.partial && m0state.tokens == 2,
+              "T16.2: no deeper anchor -> strict stands (r2 F3: the partial must earn its keep)");
 
-        // The neutral case: strict anchor AT the divergence depth (s == p == 3).
-        // The dominance rule still prefers the deeper checkpoint (L=5 covers the
-        // common tail {E}), and the mount reads from p=3 == s: NEVER shallower
-        // than the strict anchor, so the swap is safe even when the tail turns
-        // out recoverable or not (old_suffix_len=0 handles itself downstream).
+        // With a state-pool checkpoint at 3 (<= P, > s) the partial wins: it restores
+        // at 3 where the strict mount restores at 2.
+        const auto m = cache.best_with_partial(64, prompt, {}, true, {3});
+        check(m.partial,
+              "T16.3: partial chosen when its state anchor (3) is deeper than strict s (2)");
+        check(m.tokens == 3,
+              "T16.4: partial LCP == 3 (> s); the restore point (3) is deeper than the strict 2");
+        check(m.checkpoint_length == 5,
+              "T16.5: the deeper checkpoint (5) is the anchor");
+
+        // The neutral case: strict anchor AT the LCP depth (s == p == 3).  The
+        // donor's own anchors at or below P never beat s (they are the strict
+        // pass's candidates), so only a state anchor > 3 could win - there is
+        // none at or below P=3.
         auto s2 = image({1, 2, 3, 4, 5});
         s2.checkpoints = { ckpt({1, 2, 3}), ckpt({1, 2, 3, 4, 5}) };
         ConversationCache cache2(1 << 20, 4);
         cache2.put(std::move(s2));
         const auto m2 = cache2.best_with_partial(64, prompt, {}, true);
-        check(m2.tokens >= strict.tokens,
-              "T16.5: partial never reads shallower than the strict anchor (p >= s)");
-        check(!m2.partial || m2.checkpoint_length > strict.tokens,
-              "T16.5b: partial only chosen when its anchor covers strictly more (L > s)");
+        check(!m2.partial && m2.tokens == 3,
+              "T16.6: s == p -> strict stands (the donor's periodic anchors never beat it)");
 
         // Off-flag: byte-identical strict (the early-return never changes behavior).
         const auto m0 = cache.best_with_partial(0, prompt, {}, true);
         check(!m0.partial && m0.tokens == 2,
-              "T16.6: flag=0 stays byte-identical strict (2)");
+              "T16.7: flag=0 stays byte-identical strict (2)");
 
-        // Cross-conversation (review r1 finding 1): the nesting property only holds
-        // WITHIN one conversation.  Conversation A offers a strict anchor {A B C}
-        // (s=3); conversation B offers a partial candidate {A B 80 81 82} whose
-        // anchor is deeper (L=5 > s=3) but whose LCP is shallower (p=2 < s=3).
-        // The dominance swap must NOT take B's partial: it would mount at 2 and
-        // lose a token of resume vs A's strict 3.  Requires p >= s ACROSS
-        // conversations, not just L > s.
+        // Cross-conversation (review r1 finding 1 + r2 F3's repro): conversation A
+        // offers a strict anchor at 5; conversation B shares 6 tokens (LCP 6 > s!)
+        // but its only checkpoint at or before 6 is at 1.  The partial must NOT be
+        // taken: mounting it would restore at 1 where flag-off restores at 5.
         {
-            auto convA = image({1, 2, 3});
-            convA.checkpoints = { ckpt({1, 2, 3}) };
-            auto convB = image({1, 2, 80, 81, 82});
-            convB.checkpoints = { ckpt({1, 2, 80, 81, 82}) };
+            auto convA = image({1, 2, 3, 4, 5, 50, 51});
+            convA.checkpoints = { ckpt({1, 2, 3, 4, 5}) };
+            auto convB = image({1, 2, 3, 4, 5, 6, 70, 71, 72, 73});
+            convB.checkpoints = { ckpt({1}) };
             ConversationCache cache3(1 << 20, 4);
             cache3.put(std::move(convA));
             cache3.put(std::move(convB));
 
-            const auto m3 = cache3.best_with_partial(64, prompt, {}, true);
-            check(!m3.partial && m3.tokens >= 3,
-                  "T16.7: cross-conversation partial with LCP < strict never mounts (p >= s across conversations)");
-            check(m3.tokens == 3 && !m3.partial,
-                  "T16.7b: strict anchor (3) stands over B's deeper-but-shallower-LCP partial");
+            const std::vector<int32_t> p2 = {1, 2, 3, 4, 5, 6, 80, 81};
+            const auto m3 = cache3.best_with_partial(64, p2, {}, true);
+            check(!m3.partial && m3.tokens == 5,
+                  "T16.8: cross-conversation partial with a shallower anchor (1 < s=5) never mounts (r2 F3)");
+            check(m3.tokens == 5 && !m3.partial,
+                  "T16.8b: strict anchor (5) stands over B's deeper-LCP but anchor-poor partial");
         }
     }
 
@@ -509,26 +510,24 @@ int main() {
     // The M1 probe finding (2026-10-13, chain /tmp/dt-steady4.log, C-turn):
     //   parked-scan: e0.live:L=5786:skip   (prompt_len=5736)
     // The parked LIVE (prompt+response of the previous turn) is almost always
-    // slightly LONGER than the next turn's prompt, and three L > prompt.size()
-    // guards refused it without computing the LCP: the cache's consider()
-    // size-guard, conversation_lcp's n > prompt.size() early-out, and
-    // suffix_reuse_partial_apply's L > n_new refusal.  The live anchor is the
-    // single most valuable partial candidate in every edit chain - lifting the
-    // guards for the PARTIAL PASS ONLY (strict stays byte-identical) lets the
-    // partial mount recover [P, L) K/V the strict anchor cannot reach.
+    // slightly LONGER than the next turn's prompt, and the old guards refused it
+    // without computing the LCP.  The live anchor remains the most valuable partial
+    // CANDIDATE - but under the r2 F3 rule it is only CHOSEN when its deepest
+    // restorable anchor at or before P beats the strict s (a live partial never
+    // borrows, r2 F5, so it is the one partial shape that can still win).
     //
     // Safety: the LCP walk stops at min(L, prompt.size()) - tokens past the
     // prompt are irrelevant (the partial mount discards them); the strict pass
-    // keeps its own guard (a longer-than-prompt checkpoint can NEVER be a
-    // strict prefix).  The runtime routes a live-anchor partial through the
-    // narrowed_resume_target restore (state@L is stale for the edited history;
-    // see the v3 fix note in generate.cpp) - restore the deepest checkpoint
-    // <= P, arena covers [ckpt, P) by the LCP, read [P, n).
+    // keeps its own guard (a longer-than-prompt checkpoint can NEVER be a strict
+    // prefix).  The runtime routes a live-anchor partial through the
+    // narrowed_resume_target_state restore (state@L is stale for the edited
+    // history): restore the deepest checkpoint <= P across both pools, arena
+    // covers [ckpt, P) by the LCP, read [restore_length, n).
     {
-        // Parked live {A B C D E} (5) + shallow checkpoints {A B}(2), {A B C}(3).
+        // Parked live {A B C D E} (5) + checkpoints {A B}(2), {A B C}(3).
         // Request {A B C X} (4) - SHORTER than the live, edits index 3.
         // Strict: {A B C} mounts 3 (live and {A B C D E} fail: longer/edited).
-        // Partial on the live: LCP = 3, L = 5 > strict 3 -> dominance fires.
+        // Partial candidate: the live, LCP = 3, L = 5.
         auto s = image({1, 2, 3, 4, 5});
         s.checkpoints = { ckpt({1, 2}), ckpt({1, 2, 3}) };
         ConversationCache cache(1 << 20, 4);
@@ -539,43 +538,61 @@ int main() {
         check(strict.tokens == 3 && !strict.partial,
               "T17.1: strict best() mounts {A B C} (3); the longer live is refused");
 
-        const auto m = cache.best_with_partial(64, prompt, {}, true);
+        // r2 F3: the live-anchor partial's deepest restorable anchor <= P=3 is the
+        // donor's {A B C} (3) == s - equal, never deeper - so the partial is NOT
+        // chosen.  Same-conversation partials can never beat the strict mount via
+        // periodic checkpoints (the strict pass sees those); only a state-pool
+        // checkpoint deeper than s wins.
+        const auto m_eq = cache.best_with_partial(64, prompt, {}, true);
+        check(!m_eq.partial && m_eq.tokens == 3,
+              "T17.2: s == deepest anchor -> strict stands (the partial must earn its keep, r2 F3)");
+        const auto m_st = cache.best_with_partial(64, prompt, {}, true, {3});
+        check(!m_st.partial && m_st.tokens == 3,
+              "T17.3: a state anchor at s (3, not > s) does not rescue the partial either");
+
+        // With only {A B} parked (s=2) and a state checkpoint at 3 (<= P=3, > s):
+        // the live-anchor partial WINS - it restores at 3 where strict restores at 2.
+        auto s2 = image({1, 2, 3, 4, 5});
+        s2.checkpoints = { ckpt({1, 2}) };
+        ConversationCache cache2(1 << 20, 4);
+        cache2.put(std::move(s2));
+        const auto m = cache2.best_with_partial(64, prompt, {}, true, {3});
         check(m.partial,
-              "T17.2: live anchor (L=5 > prompt=4) is now a partial candidate");
+              "T17.4: live anchor chosen when its state anchor (3) beats strict s (2)");
         check(m.tokens == 3,
-              "T17.3: live-anchor partial LCP == 3 (divergence at index 3)");
+              "T17.5: live-anchor partial LCP == 3 (divergence at index 3)");
         check(m.checkpoint_length == 5,
-              "T17.4: the parked LIVE (5) is the splice anchor");
+              "T17.6: the parked LIVE (5) is the anchor");
         check(m.live,
-              "T17.5: Match.live == true (the anchor is the parked live)");
+              "T17.7: Match.live == true (the anchor is the parked live)");
 
         // The helper accepts L > n_new for the partial path (fail-closed kept
         // for every OTHER shape).  Fire with L=5, P=3, cur len 4: plan narrows
-        // to P=3, anchor 5, no common tail ({D E} vs {X}).
+        // to P=3, anchor 5.
         const std::vector<int32_t> live_tokens = {1, 2, 3, 4, 5};
         std::vector<CheckpointLength> chain = { {2, 0}, {3, 1} };
         const SuffixHookOutcome outcome = suffix_reuse_partial_apply(
             live_tokens, prompt, /*L=*/5, /*P=*/3, chain);
         check(outcome.fired,
-              "T17.6: partial_apply fires with L(5) > n_new(4)");
+              "T17.8: partial_apply fires with L(5) > n_new(4)");
         check(outcome.fired && outcome.plan_edit_pos == 3,
-              "T17.7: plan_edit_pos == 3 (the LCP)");
+              "T17.9: plan_edit_pos == 3 (the LCP)");
         check(outcome.fired && outcome.restore_anchor_length == 5,
-              "T17.8: restore_anchor_length == 5 (the live anchor)");
-        check(outcome.fired && outcome.old_suffix_len == 0,
-              "T17.9: old_suffix_len == 0 ({D E} vs {X} - no common tail)");
+              "T17.10: restore_anchor_length == 5 (the live anchor)");
+        check(compute_suffix_plan(live_tokens, prompt).old_suffix_len == 0,
+              "T17.11: plan.old_suffix_len == 0 ({D E} vs {X} - no common tail; on the plan, r2 F7)");
 
         // conversation_lcp direct: live longer than prompt walks to the prompt's
         // end and reports the prompt-bounded LCP (not 0).
         ConversationCheckpoint lc;
         lc.ids = {1, 2, 3, 4, 5};
         check(strata::core::conversation_lcp(lc, prompt, {}) == 3,
-              "T17.10: conversation_lcp walks a longer-than-prompt checkpoint (3, not 0)");
+              "T17.12: conversation_lcp walks a longer-than-prompt checkpoint (3, not 0)");
 
         // Off-flag: byte-identical strict - the live-anchor lift is flag-gated.
-        const auto m0 = cache.best_with_partial(0, prompt, {}, true);
-        check(!m0.partial && m0.tokens == 3,
-              "T17.11: flag=0 stays byte-identical strict (3)");
+        const auto m0 = cache2.best_with_partial(0, prompt, {}, true);
+        check(!m0.partial && m0.tokens == 2,
+              "T17.13: flag=0 stays byte-identical strict (2)");
 
         // A strict-longer guard REMAINS: a candidate longer than the prompt can
         // never produce p >= L (strict); the partial pass alone evaluates it.
@@ -584,7 +601,7 @@ int main() {
         ConversationCheckpoint sc;
         sc.ids = {1, 2};
         check(strata::core::conversation_lcp(sc, prompt, {}) == 2,
-              "T17.12: shorter strict-prefix checkpoint still reports its full length (2)");
+              "T17.14: shorter strict-prefix checkpoint still reports its full length (2)");
     }
 
     // ============================================================
@@ -592,30 +609,31 @@ int main() {
     // ============================================================
     // Reading [P, n) on state@checkpoint loses the gap [ckpt, P) from the
     // GDN/PLE recurrence: attention sees the gap rows through valid arena K/V,
-    // the running state never ingested them (C under-counted; gap 826 tokens).
-    // The replay gate that once re-enabled the gap-read never shipped - the
-    // splice layer it belonged to was removed after review.  The partial mount
-    // always fail-closes: read_from == restore_length (the deepest checkpoint
-    // restored through); the gap [restore, P) is re-read by the prefill.
+    // the running state never ingested them (C under-counted the ledger; gap 826
+    // tokens).  The replay gate that once re-enabled the gap-read never shipped - the
+    // splice layer it belonged to was removed after review.  The helper itself is
+    // fail-closed (r2 F4): read_from == restore_length ALWAYS - the REAL helper
+    // `narrowed_resume_target` (the same one generate.cpp calls), not a local copy.
     {
+        using strata::program::suffix_reuse::NarrowedResumeTarget;
         using strata::program::suffix_reuse::narrowed_resume_target;
         const std::vector<int64_t> chain = { 1574, 2598 };
-        // The runtime override (generate.cpp, T18): read_from = restore_length.
-        const auto fail_closed_read_from = [](int64_t P, const std::vector<int64_t>& lengths) {
-            const auto t = narrowed_resume_target(P, lengths);
-            return t.restore_length;   // read_from == restore_length (always fail-closed)
-        };
-        check(fail_closed_read_from(3424, chain) == 2598,
-              "T18.1: partial mount reads from the deepest checkpoint <= P (2598), never [P, n)");
-        check(fail_closed_read_from(3424, {}) == 0,
+        // T18.1 calls the REAL helper and asserts read_from equals the length the
+        // restored state describes (the reviewer's round-1 assert, de-tautologized).
+        const NarrowedResumeTarget t1 = narrowed_resume_target(3424, chain);
+        check(t1.restore_length == 2598,
+              "T18.1a: the deepest checkpoint <= P (3424) is 2598");
+        check(t1.read_from == t1.restore_length && t1.read_from == 2598,
+              "T18.1b: read_from == restore_length (2598) - the prefill re-reads [2598, n), never [P, n)");
+        check(narrowed_resume_target(3424, {}).read_from == 0,
               "T18.3: no checkpoint <= P -> fresh read from 0 (fail-closed, never fabricate)");
-        check(fail_closed_read_from(2000, chain) == 1574,
+        check(narrowed_resume_target(2000, chain).restore_length == 1574,
               "T18.4: P between anchors -> the deeper-below-P anchor (1574)");
         {
             const auto t = narrowed_resume_target(3424, chain);
-            check(t.read_from == 3424 && t.restore_length == 2598,
-                  "T18.2: the helper's raw read_from is P (3424); the runtime override pins it to "
-                  "restore_length (2598) - byte-equal to strict-path semantics");
+            check(t.read_from == 2598 && t.restore_length == 2598,
+                  "T18.2: the helper's raw read_from is restore_length (2598), not P - "
+                  "byte-equal to strict-path semantics by construction");
         }
     }
 
@@ -643,15 +661,15 @@ int main() {
             const NarrowedResumeTarget t = narrowed_resume_target_state(3424, checks, state);
             check(t.restore_length == 3072,
                   "T22.1: state-cadence 3072 beats periodic 2598 (deepest across both pools)");
-            check(t.read_from == 3424,
-                  "T22.1b: read still starts at P (fail-close semantics unchanged)");
+            check(t.read_from == 3072,
+                  "T22.1b: read starts at the restored checkpoint (3072; read_from == restore_length, fail-closed)");
         }
 
         // T22.2: the periodic pool wins when it is deeper (state pool empty).
         {
             const NarrowedResumeTarget t = narrowed_resume_target_state(3424, { 1574, 2598 }, {});
-            check(t.restore_length == 2598 && t.read_from == 3424,
-                  "T22.2: no state checkpoints -> deepest periodic (2598), same as today");
+            check(t.restore_length == 2598 && t.read_from == 2598,
+                  "T22.2: no state checkpoints -> deepest periodic (2598), read_from == restore_length");
         }
 
         // T22.3: fail-closed degenerates.  P below every checkpoint in both pools
@@ -679,6 +697,57 @@ int main() {
               "T22.5b: clamped to n when done+every overshoots (never past the prompt)");
         check(state_cadence_next(5600, 5736, 0) == INT64_MAX,
               "T22.5c: every = 0 -> off (INT64_MAX, the gate never fires)");
+    }
+
+    // ============================================================
+    // T23 (r2 F2): the regenerate / identical-retry shape - p == prompt.size()
+    // ============================================================
+    // Reviewer repro (r2 finding 2): parked live of length 9 (prompt 6 + reply 3),
+    // a prompt of length 6 that is a PREFIX of it, checkpoints at 2 and 5.
+    // conversation_lcp walks to p == 6 == prompt.size(); taking that as a partial
+    // match would take the donor whole with resume == n and from_live == true -
+    // the partial branch (resume < cur.size()) and the restore branch (from_live)
+    // are both skipped, the session sits at the stale state after the reply
+    // tokens, and the last prompt token never starts a verify window.  The
+    // non-live variant fails with "ERR restoring a conversation checkpoint
+    // failed".  The bound p < prompt.size() (upstream's strict
+    // conversation_prefix applies the same n < prompt.size()) refuses it: the
+    // match must behave exactly like the strict mount (resume 5), never
+    // resume == 6-with-stale-state, never an error path.
+    {
+        // parked conversation: live = prompt(6) + reply(3); checkpoints at 2 and 5
+        // (prefixes of the prompt).
+        auto s = image({1, 2, 3, 4, 5, 6, 7, 8, 9});
+        s.checkpoints = {ckpt({1, 2}), ckpt({1, 2, 3, 4, 5})};
+        ConversationCache cache(1 << 20, 4);
+        cache.put(std::move(s));
+        const std::vector<int32_t> prompt = {1, 2, 3, 4, 5, 6};   // regenerate: a prefix of the parked live
+
+        const auto st = cache.best(prompt, {}, true);
+        const auto m = cache.best_with_partial(64, prompt, {}, true);
+        check(st.tokens == 5,
+              "T23.1: strict best() mounts the checkpoint at 5 (the deepest prefix)");
+        check(!m.partial && m.tokens == 5,
+              "T23.2: best_with_partial behaves EXACTLY like the strict mount (5), never tokens=6 partial");
+        check(m.tokens < (int64_t) prompt.size(),
+              "T23.3: resume (5) < n (6) - the last prompt token still starts a verify window");
+
+        // Even a deep state pool cannot rescue a p == n candidate: it never forms.
+        const auto m_state = cache.best_with_partial(64, prompt, {}, true, {5});
+        check(!m_state.partial && m_state.tokens == 5,
+              "T23.4: a state anchor does not make the p == n shape eligible (bound first)");
+
+        // The non-live variant (the r2 "ERR restoring" repro): a parked CHECKPOINT
+        // longer than the prompt whose tokens all match - strict refuses it, the
+        // partial pass must refuse it too, leaving the no-match (fresh prefill)
+        // path - never a taken-whole donor with no mountable anchor.
+        auto s2 = image({42, 43});
+        s2.checkpoints = {ckpt({1, 2, 3, 4, 5, 6, 7, 8, 9})};
+        ConversationCache cache2(1 << 20, 4);
+        cache2.put(std::move(s2));
+        const auto m2 = cache2.best_with_partial(64, prompt, {}, true);
+        check(!m2.partial && m2.tokens == 0,
+              "T23.5: non-live p == n candidate refused - no match, no error shape (r2 F2)");
     }
 
     std::printf("suffix_reuse_partial_prefix_test: %d passed, %d failed\n", g_pass, g_fail);

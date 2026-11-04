@@ -8,7 +8,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>   // [SFX-DBG] probe: fprintf in best_with_partial's candidate scan
 #include <deque>
 #include <memory>
 #include <utility>
@@ -260,7 +259,9 @@ int64_t conversation_lcp(const ConversationCheckpoint& c, const std::vector<Toke
     // anchor in every edit chain (probe: e0.live:L=5786:skip, prompt 5736).
     // The walk is bounded by min(n, prompt.size()): tokens past the prompt are
     // irrelevant (the partial mount discards them), and the p == n < prompt.size
-    // case reports the full length (the strict-prefix shape, unchanged).
+    // case reports the full length (the strict-prefix shape, unchanged).  The CALLER
+    // (best_with_partial) refuses p >= prompt.size() (r2 F2: taking a donor whole at
+    // resume == n skips both mount branches and leaves the session at stale state).
     int64_t p = 0;
     while (p < (int64_t) n && p < (int64_t) prompt.size() &&
            c.ids[(size_t) p] == (Token) prompt[(size_t) p]) ++p;
@@ -386,13 +387,29 @@ public:
     /// Phase 3b: flag-gated partial-prefix match.  At `flag <= 0` (and on-flag when a strict
     /// match exists) this is byte-identical to `best()`: same loop, same `conversation_prefix`,
     /// same tie-break by most recently parked.  At `flag > 0` with NO strict match, falls back
-    /// to the longest LCP `p` such that `0 < p < c.ids.size()` and the image check at positions
-    /// < p matches; the returned Match has `partial = true, tokens = p, checkpoint_length = L`.
-    /// Ties: longest LCP wins, then longest checkpoint (a deeper anchor gives the splice more
-    /// K rows to rotate for the unchanged tail), then most recently parked (same as `best()`).
+    /// to the longest LCP `p` such that `0 < p < c.ids.size()` AND `p < prompt.size()` (r2 F2:
+    /// p == prompt.size() is the regenerate/identical-retry shape - the donor would be taken
+    /// whole with resume == n and the last prompt token would never start a verify window;
+    /// upstream's strict conversation_prefix applies the same n < prompt.size() bound); the
+    /// returned Match has `partial = true, tokens = p, checkpoint_length = L`.
+    ///
+    /// `state_lengths` (r2 F3) carries the SESSION's state-checkpoint lengths (the
+    /// fine-cadence side pool): a partial mount is chosen ONLY when its deepest restorable
+    /// anchor at or before P - across the donor's periodic checkpoints AND that pool - is
+    /// DEEPER than the strict match's s.  With the splice gone, reads start at the restored
+    /// anchor, and a donor's periodic checkpoints at or before P are prefixes the strict pass
+    /// already sees, so without this rule a partial mount can restore at a shallower point
+    /// than flag-off would.
+    ///
+    /// Ties: longest LCP wins, then longest checkpoint, then most recently parked (same as
+    /// `best()`).  A partial match that would BORROW (`borrows()` - P below the donor's
+    /// deepest checkpoint) is never eligible (r2 F5: the borrow path mounts a checkpoint at
+    /// exactly P, which does not exist for a partial match - "ERR restoring a conversation
+    /// checkpoint failed"; skipping it lets the strict mount win).
     template<class Token>
     Match best_with_partial(int64_t flag, const std::vector<Token>& prompt,
-                            const std::vector<ConversationImageKey>& images, bool cvec) const {
+                            const std::vector<ConversationImageKey>& images, bool cvec,
+                            const std::vector<int64_t>& state_lengths = {}) const {
         if (flag <= 0) return best(prompt, images, cvec);   // flag off: byte-identical
         Match m;
         // strict first (same as best()).
@@ -406,64 +423,48 @@ public:
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);
         }
-        // FW-1 splice engagement (2026-10-13): do NOT return at the first strict
-        // match.  One conversation's checkpoints are nested prefixes of ONE history,
-        // so that history diverges from this request at a single point D and every
-        // strict anchor s <= D equals the partial LCP p of the SAME conversation's
-        // deeper checkpoints.  A partial mount therefore never reads from a
-        // shallower point than the strict match would (p >= s), and its splice may
-        // recover K/V up to the anchor length L.  Keep the partial candidate when
-        // its checkpoint covers strictly more than the strict anchor (L > s);
-        // otherwise the strict match stands (no splice cost when it cannot recover
-        // more).  Without this, a mid-file edit always strict-mounts the anchor
-        // just below the edit and the splice never engages (partial-branch
-        // enter=0 in every steady-state trace - measured 2026-10-13).
         const int64_t strict_tokens = m.tokens;
-        // partial pass: longest LCP > 0 and < c.ids.size(); tie-break by deeper anchor
-        // (longer checkpoint) then by most recently parked (the loop iterates newest-first).
+        // partial pass: longest LCP p with 0 < p < c.ids.size() AND p < prompt.size();
+        // tie-break by deeper anchor (longer checkpoint) then by most recently parked
+        // (the loop iterates newest-first).
         Match pm;   // the best partial candidate (tokens = LCP, checkpoint_length = L)
-        // [SFX-DBG] probe: per-candidate partial scan visibility.  The steady-state chain showed
-        // parked-search reporting match{tokens=2598 partial=0} where the source says a partial
-        // candidate (LCP 3424, anchor 5702) should dominate strict 2598 - log every candidate's
-        // L/idx/LCP so the steady-state trace can attribute the miss to the candidate set, the
-        // LCP guard, or the size guard.  Gated `flag > 0` (probe on the sfx path only).
-        const bool dbg_partial = flag > 0;
-        if (dbg_partial)
-            std::fprintf(stderr, "[SFX-DBG] parked-scan: entries=%zu prompt_len=%zu strict_tokens=%lld:",
-                         entries_.size(), prompt.size(), (long long) strict_tokens);
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
-            if (e.cvec != cvec) { if (dbg_partial) std::fprintf(stderr, " e%zu:cvec", i); continue; }
+            if (e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t L = (int64_t) c.ids.size();
-                // T17: the size guard is lifted for the PARTIAL pass - a longer-than-prompt
+                // The size guard is lifted for the PARTIAL pass - a longer-than-prompt
                 // candidate (the parked live) is the most valuable partial anchor.  The strict
                 // pass above keeps its own guard (conversation_prefix refuses longer), so this
                 // scan alone can surface it.  L < 1 stays refused (empty).
-                if (L < 1) {
-                    if (dbg_partial) std::fprintf(stderr, " e%zu.%s:L=%lld:skip", i, live ? "live" : "ck", (long long) L);
-                    return;
-                }
+                if (L < 1) return;
                 const int64_t p = conversation_lcp(c, prompt, images);
-                if (dbg_partial)
-                    std::fprintf(stderr, " e%zu.%s:L=%lld:lcp=%lld", i, live ? "live" : "ck", (long long) L, (long long) p);
-                if (p <= 0 || p >= L) return;                         // 0 LCP or strict (already tried)
+                // r2 F2: p >= prompt.size() (the regenerate shape) is refused; p >= L is the
+                // strict shape the pass above already tried.
+                if (p <= 0 || p >= L || p >= (int64_t) prompt.size()) return;
                 if (p > pm.tokens || (p == pm.tokens && L > pm.checkpoint_length))
                     pm = {i, p, live, serials_[i], true, L};
             };
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);
         }
-        if (dbg_partial) std::fprintf(stderr, " -> pm{tokens=%lld L=%lld} strict=%lld\n",
-                                      (long long) pm.tokens, (long long) pm.checkpoint_length,
-                                      (long long) strict_tokens);
-        // Cross-conversation safety (review r1 finding 1, 2026-10-13): the nesting
-        // argument above is SAME-conversation only.  A DIFFERENT conversation's
-        // partial can have a deeper anchor (L > s) with a shallower LCP (p < s);
-        // mounting it would read from a shallower point than the strict match.
-        // Require p >= s as well as L > s.  (Single-conversation behavior is
-        // unchanged: there p >= s always holds, so the added term never binds.)
-        if (pm.tokens > 0 && pm.tokens >= strict_tokens && pm.checkpoint_length > strict_tokens) return pm;
+        if (pm.tokens <= 0) return m;                       // no partial candidate: strict stands
+        // r2 F5: a partial match that would borrow is never eligible - the borrow path
+        // mounts a checkpoint at exactly P and there is none (P is the LCP, below the
+        // donor's deepest checkpoint).  Skip it; the strict mount wins.
+        if (pm.partial && borrows(pm)) return m;
+        // r2 F3: the partial mount must EARN its keep.  Its restore point after the mount
+        // is the deepest anchor at or before P across both pools (the donor's periodic
+        // checkpoints that move with the taken image, plus the session's state pool the
+        // caller passes in).  Choose it only when that anchor is deeper than the strict
+        // match's s; otherwise the strict mount restores at least as deep for less.
+        int64_t anchor = 0;
+        for (const auto& c : entries_[pm.index].checkpoints)
+            if ((int64_t) c.ids.size() <= pm.tokens) anchor = std::max(anchor, (int64_t) c.ids.size());
+        for (const int64_t L : state_lengths)
+            if (L <= pm.tokens) anchor = std::max(anchor, L);
+        if (anchor > strict_tokens && pm.tokens >= strict_tokens && pm.checkpoint_length > strict_tokens)
+            return pm;
         return m;                                            // strict match wins; partial ignored
     }
 

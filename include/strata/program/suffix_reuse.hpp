@@ -197,7 +197,7 @@ inline std::string validate_suffix_reuse_options(int64_t cache_suffix_reuse, int
     // with Q4_0 dequant/requant, measured by the since-deleted int8 splice suite); falls
     // through to the kv_resident / layer_split refusals below like every quant format.
     if (kv_format != "fp16" && kv_format != "int8" && kv_format != "k8v4" && kv_format != "q4_0")
-        return "--cache-suffix-reuse N requires --kv fp16 or --kv int8 (see plans/2026-10-11_184000-strata-suffix-reuse-phase2-v2.md)";
+        return "--cache-suffix-reuse N requires --kv fp16, int8, k8v4 or q4_0";   // (r2 F7: the message now matches the four accepted formats)
     if (kv_resident > 0)
         return "--cache-suffix-reuse N is unsupported with --kv-resident (streaming-ring splice "
                "is Phase 3)";
@@ -287,26 +287,22 @@ inline bool suffix_reuse_should_invalidate(int64_t flag, bool from_live, int64_t
 /// the one the request actually mounts through, and the shortest checkpoint would always yield
 /// edit_pos=0 on a pure continuation, narrowing `resume` and pessimising the common case).  We
 /// then drop checkpoints with `length > plan.edit_pos` from `chain` and surface the plan.
+/// (r2 review F1 deleted the runtime strict hook - `resume` always comes from a checkpoint
+/// that is a prefix of the new prompt, so it can never usefully narrow.  The helper stays:
+/// it is the shared seam the CPU parity tests exercise, and `suffix_reuse_partial_apply`
+/// below is the shape the live partial-mount branch calls.)
 ///
-/// Phase 2 Task 1: the outcome also carries the splice plan's tail fields so the runtime
-/// can read them.  The names mirror `SuffixReusePlan` (old_suffix_len, new_suffix_len,
-/// deltas, replay_from) so a single struct describes both decisions: which checkpoints to keep
-/// and what the (removed) rotation layer would have consumed.  Fields are populated on the
-/// `fired` path only; at `!fired` the runtime
-/// sees zeros, an empty `deltas`, and the doc says "no splice planned".  This is a pure struct
-/// extension - no behaviour change; the runtime consumer lands in Task 2.
+/// Fields are populated on the `fired` path only; at `!fired` the runtime sees zeros and an
+/// empty `chain`, and the doc says "no splice planned".
 struct SuffixHookOutcome {
     std::vector<CheckpointLength> chain;   ///< the chain after invalidation (== input when not fired)
     bool fired = false;                     ///< the predicate's verdict (== false -> chain untouched)
     int64_t plan_edit_pos = 0;             ///< Phase 3a T9: the splice hook's narrowing signal (LCP-based, == SuffixReusePlan::narrow_pos).  Where to narrow resume and which checkpoints to keep.
-    int64_t k_rotation_start = 0;          ///< Phase 3a T9: the tail start in OLD (suffix-walk-derived, == n_old - old_suffix_len, == SuffixReusePlan::edit_pos).  The unchanged tail from the back.  For a pure continuation this is 0 (irrelevant; old_suffix_len == 0).  Kept: suffix_reuse_partial_apply still fills it.
-    // ---- Phase 2 Task 1: splice plan tail fields (kept: suffix_reuse_partial_apply still fills them) ----
-    int64_t old_suffix_len = 0;            ///< common-tail tokens in the OLD prompt (== SuffixReusePlan::old_suffix_len)
-    int64_t new_suffix_len = 0;            ///< common-tail tokens in the NEW prompt (== SuffixReusePlan::new_suffix_len)
-    std::vector<int64_t> deltas;            ///< per-token position offsets (uniform case: empty, single delta suffices)
     int64_t replay_from = 0;                ///< position the linear-state replay (Task 5) starts from; == plan.narrow_pos
-    bool    uniform = false;                ///< true -> single rotation by `delta`; false -> per-token `deltas`
-    int64_t delta = 0;                      ///< uniform position offset when `uniform` is true
+    // (r2 review F7: the K-rotation tail fields the removed splice layer consumed -
+    // k_rotation_start, old/new_suffix_len, deltas, uniform, delta - were dead and
+    // are deleted; the rotation layer itself is gone.  SuffixReusePlan still carries
+    // the tail fields for the pure plan computation the tests pin.)
     // ---- Phase 3b: partial-prefix mount anchor ----
     // When > 0, the splice path mounted a partial-prefix checkpoint (its LCP is `plan_edit_pos` <
     // `restore_anchor_length`): the runtime restores the checkpoint's running state at length
@@ -341,19 +337,10 @@ inline SuffixHookOutcome suffix_reuse_apply_invalidation(
     // (the anchor below the edit survives).
     SuffixReusePlan plan = compute_suffix_plan(resume_checkpoint_tokens, cur_tokens);
     // Phase 3a T9: outcome.plan_edit_pos is the splice hook's narrowing signal (narrow_pos,
-    // LCP-based).  outcome.k_rotation_start is the K rotation start in OLD (edit_pos,
-    // suffix-based) - the unchanged tail from the back.  The legacy suffix-derived
-    // `plan.edit_pos` is still surfaced for the T1/T4 backward-compat tests.
+    // LCP-based).  The K-rotation tail fields the plan also computes have no outcome
+    // consumers since the rotation layer was removed (r2 review F7) - the plan itself
+    // is still what the CPU tests pin via compute_suffix_plan.
     out.plan_edit_pos = plan.narrow_pos;
-    out.k_rotation_start = plan.edit_pos;
-    // Phase 2 Task 1: surface the splice plan's tail fields so the runtime can read
-    // them straight off the outcome (no second pass over resume_checkpoint_tokens / cur_tokens).
-    // Names mirror `SuffixReusePlan` to keep both structs in lockstep (r1 Minor 5: name match).
-    out.old_suffix_len = plan.old_suffix_len;
-    out.new_suffix_len = plan.new_suffix_len;
-    out.uniform       = plan.uniform;
-    out.delta         = plan.delta;
-    out.deltas        = plan.deltas;
     out.replay_from   = plan.replay_from;
     // the canonical invalidation: drop checkpoints with length > narrow_pos (= the splice
     // hook's narrowing signal).  For a pure continuation narrow_pos == n_old == resume, so the
@@ -373,25 +360,25 @@ inline SuffixHookOutcome suffix_reuse_apply_invalidation(
 }
 
 /// Phase 2 wiring bug 2 (T8): the splice hook narrows `resume` to `plan_edit_pos`, and
-/// its own erase (in `suffix_reuse_apply_invalidation`'s caller at generate.cpp:9034-9043)
-/// removes the exact-length checkpoint the restore search later wants.  This pure
-/// helper decides, given a narrowed resume and the live `checks` chain, where the
-/// request continues from - the gap-read / replay path phase 2 was designed for.
+/// its own erase removes the exact-length checkpoint the restore search later wants.  This
+/// pure helper decides, given a narrowed resume and the live `checks` chain, where the
+/// request continues from.
 ///
 /// `chain_lengths` carries only the candidate lengths (the helper compares sizes
 /// only); generate.cpp projects its `ConvCheckpoint::ids.size()` into a vector at the
 /// call site so this stays header-only / CPU-testable.
 ///
 /// `NarrowedResumeTarget::restore_length` is the checkpoint length the request
-/// restores through; `read_from` is the position the chunk loop reads from (== 0 when
-/// no usable mount survives - a fresh prefill from the start, NO error).
+/// restores through; `read_from` is the position the chunk loop reads from.  FAIL-CLOSED
+/// (r2 review F4): `read_from == restore_length` ALWAYS - the chunk loop starts reading
+/// at the position the restored state describes, so the gap [restore_length,
+/// narrowed_resume) is re-read by the prefill, never skipped (reading [narrowed, n) on
+/// the restored state loses the gap from the GDN/PLE recurrence - T18).
 ///
 /// Cases:
-///   - exact-length candidate exists:  restore_length = that length, read_from = narrowed_resume
-///                                     (no gap; byte-equivalent to today's restore path).
-///   - no exact-length, deepest-below: restore_length = deepest length <= narrowed_resume,
-///                                     read_from = narrowed_resume (the [restore, narrowed)
-///                                     gap is re-read by the existing prefill path).
+///   - candidate exists at or below:  restore_length = deepest length <= narrowed_resume,
+///                                     read_from = restore_length (the gap up to the
+///                                     narrowed resume is re-read by the prefill).
 ///   - no candidate at or below:       restore_length = 0, read_from = 0
 ///                                     (no usable mount; full re-prefill, no error).
 ///
@@ -399,12 +386,12 @@ inline SuffixHookOutcome suffix_reuse_apply_invalidation(
 /// the pre-fix "ERR restoring a conversation checkpoint failed" path.
 struct NarrowedResumeTarget {
     int64_t restore_length = 0;   ///< checkpoint length the request restores through (0 -> fresh read)
-    int64_t read_from      = 0;   ///< position the chunk loop reads from (= 0 when restore_length == 0)
-    // Phase 3b: partial-prefix mount anchor.  When > 0, the runtime restores a checkpoint of
-    // length `restore_anchor_length` (the partial-match candidate C, length L > P) and the
-    // chunk loop reads from `read_from` (= the LCP P).  The strict-mount path leaves this at
-    // 0 and uses `restore_length` as before.  Set by the partial-mount branch in generate.cpp
-    // when `parked.partial` is true and the partial helper fires.
+    int64_t read_from      = 0;   ///< position the chunk loop reads from (== restore_length; 0 when restore_length == 0)
+    // Phase 3b: partial-prefix mount anchor.  When > 0, the runtime restored the
+    // partial-mount image whose deepest anchor C has length > P; the chunk loop still
+    // reads from `read_from` (== restore_length, fail-closed).  The strict-mount path
+    // leaves this at 0.  Set by the partial-mount branch in generate.cpp when
+    // `parked.partial` is true and the partial helper fires.
     int64_t restore_anchor_length = 0;
 };
 inline NarrowedResumeTarget narrowed_resume_target(int64_t narrowed_resume,
@@ -430,7 +417,7 @@ inline NarrowedResumeTarget narrowed_resume_target(int64_t narrowed_resume,
         return t;
     }
     t.restore_length = best;
-    t.read_from      = narrowed_resume;   // gap [best, narrowed_resume) is re-read by the chunk loop
+    t.read_from      = best;   // fail-closed: the chunk loop starts where the restored state ends
     return t;
 }
 
@@ -438,9 +425,10 @@ inline NarrowedResumeTarget narrowed_resume_target(int64_t narrowed_resume,
 /// checkpoints (deep anchors); `state_checks` are fine-cadence state-only
 /// checkpoints (checkpoint_save copies gdn/ple/tails/dead/block_pos only - no
 /// K/V - so each is ~100-150ms, T19).  The deepest checkpoint <= P across BOTH
-/// pools is restored; the chunk loop still reads [P, n) - fail-close semantics
-/// unchanged, the gap [restore, P) just shrinks.  Equal lengths are dedup-free:
-/// deepest is deepest, whichever pool it came from.
+/// pools is restored, and the chunk loop reads from that checkpoint's length
+/// (read_from == restore_length, fail-closed - the gap [restore, P) is re-read
+/// by the prefill; only its size shrinks when the state pool wins).  Equal
+/// lengths are dedup-free: deepest is deepest, whichever pool it came from.
 inline NarrowedResumeTarget narrowed_resume_target_state(
         int64_t narrowed_resume, const std::vector<int64_t>& chain_lengths,
         const std::vector<int64_t>& state_lengths) {
@@ -448,7 +436,7 @@ inline NarrowedResumeTarget narrowed_resume_target_state(
     for (int64_t L : state_lengths) {
         if (L <= narrowed_resume && L > t.restore_length) {
             t.restore_length = L;
-            t.read_from      = narrowed_resume;
+            t.read_from      = L;
         }
     }
     return t;
@@ -464,19 +452,13 @@ inline int64_t state_cadence_next(int64_t done, int64_t n, int64_t every) {
     return next >= n ? n : next;
 }
 
-/// Phase 3a T10: the runtime's `read_from` resolution at generate.cpp:9394.  When the splice
-/// hook fired AND narrowed resume (splice_narrowed == true), the chunk loop's read start is
-/// `t.read_from` (the splice-narrowed resume = the edit pos E), NOT `resume` (the restored
-/// anchor C).  Otherwise the legacy rules apply: STRATA_CKPT_REREAD rebuilds the whole
-/// prefill from 0, and the normal path starts at `resume` (the deepest usable mount).
-///
-/// Without this helper the runtime at line 9394 used `reread_to > 0 ? 0 : resume`, which
-/// discarded `t.read_from` and re-read [anchor, n) - the rotated region [C, E) the splice
-/// just set up AND the gap [E, n) the splice's gap-read was supposed to handle.  The
-/// gap-read IS the splice's saved work; discarding it makes the splice a no-op on the
-/// prefill path (GLM review MAJOR-1: the K rotation is then redundantly overwritten by
-/// the fresh prefill, but the prefill re-reads C..n instead of E..n, which is the actual
-/// regression).
+/// Phase 3a T10: the runtime's `read_from` resolution.  When the partial mount fired
+/// (splice_narrowed == true), the chunk loop's read start is `t.read_from`, which the
+/// helpers pin to the restored checkpoint's length (fail-closed, r2 review F4) - NOT
+/// `resume`, which at that point holds the restored length for the search below but is
+/// kept separate so the wiring stays explicit.  Otherwise the legacy rules apply:
+/// STRATA_CKPT_REREAD rebuilds the whole prefill from 0, and the normal path starts at
+/// `resume` (the deepest usable mount).
 ///
 /// The helper is pure and header-only so the T10 test pins it.  generate.cpp's call site
 /// is `const int64_t read_from = wire_splice_read_from(splice_narrowed, t, resume, reread_to);`
@@ -486,7 +468,7 @@ inline int64_t wire_splice_read_from(bool splice_narrowed,
                                      int64_t resume,
                                      int64_t reread_to) {
     if (reread_to > 0) return 0;                          // STRATA_CKPT_REREAD: rebuild from 0
-    if (splice_narrowed) return t.read_from;              // gap-read: [edit pos E, n) only
+    if (splice_narrowed) return t.read_from;              // fail-closed: read [restore_length, n)
     return resume;                                         // legacy: re-read from the restored mount
 }
 
@@ -494,28 +476,25 @@ inline int64_t wire_splice_read_from(bool splice_narrowed,
 /// `ConversationCache::best_with_partial(flag>0, ...)` returns a Match with `partial = true`,
 /// the engine has a checkpoint C of length L whose first P tokens (= LCP) match the new
 /// prompt's first P tokens and diverge at P (a mid-file edit past P).  The runtime mounts C
-/// (restores its running state at length L), and the chunk loop reads from P.  The splice
-/// plan (LCP-based `narrow_pos = P`, suffix-based `old_suffix_len` / `new_suffix_len` for the
-/// unchanged tail from the back) drives the K rotation in [P, L) - the same machinery the
-/// strict-mount splice path uses, but the resume and the chunk-loop read start differ.
+/// (restores the parked image), then restores the deepest checkpoint <= P and re-reads
+/// [restore_length, n) - fail-closed, the same semantics as the strict path (the K-rotation
+/// layer that used to run here was removed after review).
 ///
 /// This helper centralises the outcome so the runtime integration test can pin the exact
 /// field values without GPU.  Inputs:
 ///   `partial_ck_tokens`  the full checkpoint C's tokens (length L)
 ///   `cur_tokens`         the new prompt's tokens
 ///   `partial_ck_length`  L (== partial_ck_tokens.size())
-///   `partial_resume`     P (the LCP; the chunk loop's read start)
+///   `partial_resume`     P (the LCP)
 /// Returns a `SuffixHookOutcome` with:
 ///   fired = true
 ///   plan_edit_pos = P (== narrow_pos of the LCP-based plan)
-///   restore_anchor_length = L (the runtime restores C's running state, not P's)
-///   old_suffix_len / new_suffix_len / deltas / uniform / delta = the K-rotation plan
-///   chain = the input chain with every entry whose length > P dropped (the runtime's
-///           post-splice erase keeps anchors at or below the LCP; the anchor C of length L
-///           is also dropped by the chain filter but the runtime uses `restore_anchor_length`
-///           to restore C directly - see generate.cpp's `else if (!from_live)` branch).
+///   restore_anchor_length = L (the parked image's anchor; the runtime restores the
+///                            deepest checkpoint <= P, never state@L)
+///   chain = the input chain with every entry whose length > P dropped, except the entry
+///           with `length == L` (the anchor itself - see below)
 ///
-/// Fail-closed: any unsupported input (L > cur.size(), P not in (0, L), LCP inconsistent with
+/// Fail-closed: any unsupported input (P not in (0, L), LCP inconsistent with
 /// the token equality check) returns `fired = false` and the runtime degrades to today's full
 /// re-read.  Never crashes, never fabricates a checkpoint.
 inline SuffixHookOutcome suffix_reuse_partial_apply(
@@ -548,18 +527,13 @@ inline SuffixHookOutcome suffix_reuse_partial_apply(
         return out;
     }
     // The plan: same compute_suffix_plan the strict path uses, but `old` is C's full tokens
-    // (length L) and `new` is the new prompt.  LCP-based narrow_pos = P (verified above);
-    // suffix-based edit_pos = L - old_suffix_len; the K rotation operates on [edit_pos, L).
+    // (length L) and `new` is the new prompt.  LCP-based narrow_pos = P (verified above).
+    // The K-rotation tail fields the plan computes have had no consumer since the rotation
+    // layer was removed (r2 review F7); only the narrowing signal and the anchor surface.
     SuffixReusePlan plan = compute_suffix_plan(partial_ck_tokens, cur_tokens);
     if (plan.narrow_pos != P) return out;                     // defensive: LCP claim failed
     out.fired = true;
     out.plan_edit_pos = plan.narrow_pos;
-    out.k_rotation_start = plan.edit_pos;
-    out.old_suffix_len = plan.old_suffix_len;
-    out.new_suffix_len = plan.new_suffix_len;
-    out.uniform       = plan.uniform;
-    out.delta         = plan.delta;
-    out.deltas        = plan.deltas;
     out.replay_from   = plan.replay_from;
     out.restore_anchor_length = L;                            // the partial-mount anchor
     // chain filter: drop entries with length > P (the LCP) - the runtime's post-splice erase

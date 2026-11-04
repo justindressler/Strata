@@ -12,16 +12,15 @@
 // (GPU-verified by orchestrator): `checks`={3240, 3244}, `resume` narrowed to 3239 ->
 // c==nullptr -> 400.  Off-arm (flag absent) identical traffic: mounts 3240, serves ~1s.
 //
-// THE FIX (route c - the gap-read / replay path).  The header `suffix_reuse.hpp` gains a
+// THE FIX (route c - the fail-closed restore pick).  The header `suffix_reuse.hpp` gains a
 // pure helper `narrowed_resume_target` that decides, given a narrowed resume and the
 // live `checks` chain, what the request's next move is:
 //
-//   - exact-length candidate exists:  restore it; read_from = narrowed resume
-//                                     (no gap; byte-equivalent to today's restore).
-//   - no exact-length, deepest-below: restore the deepest ck with length <= narrowed;
-//                                     read_from = narrowed resume (the [ck, narrowed)
-//                                     gap is re-read by the existing prefill path - the
-//                                     "replay" / gap-read path phase 2 was designed for).
+//   - candidate exists at or below:  restore the deepest ck with length <= narrowed;
+//                                     read_from = restore_length (r2 F4: the chunk loop
+//                                     starts reading at the position the restored state
+//                                     describes - the [ck, narrowed) gap is re-read by the
+//                                     prefill, never skipped).
 //   - no candidate at or below:       restore_length = 0, read_from = 0
 //                                     (no usable mount; full re-prefill, NO error).
 //
@@ -35,7 +34,7 @@
 //
 //   T8.1 LIVE RED    3239, {3240, 3244}                 -> restore=0,    read_from=0
 //   T8.2 EXACT-LEN   3239, {200, 3239, 3240}            -> restore=3239, read_from=3239
-//   T8.3 DEEPEST-BEL 3239, {100,200,1500,3240,3244}     -> restore=1500, read_from=3239
+//   T8.3 DEEPEST-BEL 3239, {100,200,1500,3240,3244}     -> restore=1500, read_from=1500
 //   T8.4 CONTINUATN  3000, {200,1000,2000,3000,3240}    -> restore=3000, read_from=3000
 //   T8.5 NO CHECKS   3239, {}                           -> restore=0,    read_from=0
 //
@@ -93,14 +92,15 @@ int main() {
 
     // ---- T8.3 DEEPEST-BELOW: 3239, {100, 200, 1500, 3240, 3244} ----
     // No exact-length; deepest surviving ck below the narrowed resume is 1500.
-    // Restore 1500 and re-read the [1500, 3239) gap via the existing prefill path.
+    // Restore 1500; the chunk loop starts AT the restored checkpoint (r2 F4:
+    // read_from == restore_length) so the [1500, 3239) gap is re-read by the prefill.
     {
         const std::vector<int64_t> chain{100, 200, 1500, 3240, 3244};
         const NarrowedResumeTarget t = narrowed_resume_target(3239, chain);
         check(t.restore_length == 1500,
               "T8.3 deepest-below: ck@1500 is deepest <= 3239; restore_length=1500");
-        check(t.read_from == 3239,
-              "T8.3 deepest-below: gap [1500, 3239) is re-read; read_from=3239");
+        check(t.read_from == 1500,
+              "T8.3 deepest-below: read_from == restore_length (1500); the [1500, 3239) gap is re-read");
     }
 
     // ---- T8.4 PURE CONTINUATION: 3000, {200, 1000, 2000, 3000, 3240} ----
