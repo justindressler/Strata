@@ -406,10 +406,18 @@ public:
     /// deepest checkpoint) is never eligible (r2 F5: the borrow path mounts a checkpoint at
     /// exactly P, which does not exist for a partial match - "ERR restoring a conversation
     /// checkpoint failed"; skipping it lets the strict mount win).
+    ///
+    /// `local_floor` (r4 F2) is the session's own flag-off restore depth -
+    /// max(local resume, slot tokens).  The dominance rule measures the anchor against
+    /// max(strict s, local_floor), not s alone: the caller takes the donor on P beating
+    /// that same floor, so an anchor between the floor and s would park the session's
+    /// conversation and restore SHALLOWER than flag-off.  Default 0 = the r2 shape
+    /// (no session state to protect).
     template<class Token>
     Match best_with_partial(int64_t flag, const std::vector<Token>& prompt,
                             const std::vector<ConversationImageKey>& images, bool cvec,
-                            const std::vector<int64_t>& state_lengths = {}) const {
+                            const std::vector<int64_t>& state_lengths = {},
+                            int64_t local_floor = 0) const {
         if (flag <= 0) return best(prompt, images, cvec);   // flag off: byte-identical
         Match m;
         // strict first (same as best()).
@@ -453,17 +461,21 @@ public:
         // mounts a checkpoint at exactly P and there is none (P is the LCP, below the
         // donor's deepest checkpoint).  Skip it; the strict mount wins.
         if (pm.partial && borrows(pm)) return m;
-        // r2 F3: the partial mount must EARN its keep.  Its restore point after the mount
-        // is the deepest anchor at or before P across both pools (the donor's periodic
-        // checkpoints that move with the taken image, plus the session's state pool the
-        // caller passes in).  Choose it only when that anchor is deeper than the strict
-        // match's s; otherwise the strict mount restores at least as deep for less.
+        // r2 F3 + r4 F2: the partial mount must EARN its keep.  Its restore point after
+        // the mount is the deepest anchor at or before P across both pools (the donor's
+        // periodic checkpoints that move with the taken image, plus the session's state
+        // pool the caller passes in).  Choose it only when that anchor is deeper than the
+        // strict match's s AND the session's own flag-off floor max(resume, slot_tokens)
+        // (r4 F2: the caller takes the donor on P beating that floor - an anchor below it
+        // would park the session's conversation and restore shallower than flag-off);
+        // otherwise the strict mount restores at least as deep for less.
         int64_t anchor = 0;
         for (const auto& c : entries_[pm.index].checkpoints)
             if ((int64_t) c.ids.size() <= pm.tokens) anchor = std::max(anchor, (int64_t) c.ids.size());
         for (const int64_t L : state_lengths)
             if (L <= pm.tokens) anchor = std::max(anchor, L);
-        if (anchor > strict_tokens && pm.tokens >= strict_tokens && pm.checkpoint_length > strict_tokens)
+        const int64_t floor = std::max(strict_tokens, local_floor);
+        if (anchor > floor && pm.tokens >= strict_tokens && pm.checkpoint_length > strict_tokens)
             return pm;
         return m;                                            // strict match wins; partial ignored
     }

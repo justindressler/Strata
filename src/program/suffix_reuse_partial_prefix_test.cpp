@@ -501,6 +501,69 @@ int main() {
                   "T16.8: cross-conversation partial with a shallower anchor (1 < s=5) never mounts (r2 F3)");
             check(m3.tokens == 5 && !m3.partial,
                   "T16.8b: strict anchor (5) stands over B's deeper-LCP but anchor-poor partial");
+
+            // r4 F1 (review r3 MAJOR 1): a state entry from an UNRELATED conversation is
+            // not a restorable anchor.  generate.cpp builds sfx_state_lengths with the same
+            // starts_with rule the post-mount off_path erase uses, so the entry at 6 (whose
+            // ids are NOT a prefix of p2) never reaches this call.  Pinned in two steps:
+            // the RAW pool {6} WOULD flip the decision (the hazard the caller-side filter
+            // closes - this is the reviewer's xconv.cpp repro), and the FILTERED pool
+            // (empty here) keeps the strict mount at 5, exactly as T16.8.
+            const auto m_raw = cache3.best_with_partial(64, p2, {}, true, {6});
+            check(m_raw.partial && m_raw.tokens == 6 && m_raw.checkpoint_length == 10,
+                  "T16.8c (hazard): the RAW unfiltered pool {6} WOULD take B's partial (tokens=6, L=10)");
+            const auto m3c = cache3.best_with_partial(64, p2, {}, true);
+            check(!m3c.partial && m3c.tokens == 5,
+                  "T16.8c: a NON-prefix state entry at 6 does not change the decision (strict mount at 5 wins)");
+        }
+
+        // ============================================================
+        // T16.9 (r4 F2, review r3 MAJOR 2): the anchor must beat the SESSION's
+        // floor - max(local resume, slot_tokens) - not just the parked strict s.
+        // The reviewer's numbers: session resume = 100 (the floor), the parked
+        // strict match is 64, the donor's LCP is P = 200 with a prefix state
+        // anchor at 90 (or 150).
+        // ============================================================
+        {
+            std::vector<int32_t> prompt;
+            for (int32_t i = 0; i < 256; ++i) prompt.push_back(i + 1);
+            // Conversation A: live + checkpoint are a strict 64-token prefix of the prompt.
+            auto convA = image({1});
+            convA.live.ids.assign(prompt.begin(), prompt.begin() + 64);
+            ConversationCheckpoint c64;
+            c64.ids.assign(prompt.begin(), prompt.begin() + 64);
+            c64.gdn.resize(64, 1);
+            convA.checkpoints = { c64 };
+            // Conversation B (the donor): live shares 200 tokens then diverges; its only
+            // periodic checkpoint is at 1, so the state pool alone supplies the anchor.
+            auto convB = image({1});
+            convB.live.ids.assign(prompt.begin(), prompt.begin() + 200);
+            for (int32_t t = 5001; t <= 5003; ++t) convB.live.ids.push_back(t);   // L = 203
+            convB.checkpoints = { ckpt({1}) };
+            ConversationCache cache4(1 << 20, 4);
+            cache4.put(std::move(convA));
+            cache4.put(std::move(convB));
+
+            const auto strict = cache4.best(prompt, {}, true);
+            check(strict.tokens == 64 && !strict.partial,
+                  "T16.9.1: setup - the parked strict match is A's 64-token prefix");
+
+            // r3 bug shape: without the floor, the anchor at 90 beats s=64 and the
+            // partial is taken even though the session's own resume is 100 - the
+            // restore would land at 90, SHALLOWER than flag-off's 100.
+            const auto m_bug = cache4.best_with_partial(64, prompt, {}, true, {90});
+            check(m_bug.partial && m_bug.tokens == 200,
+                  "T16.9.2 (hazard): without the floor, anchor 90 > s=64 takes the partial (the r3 MAJOR 2 shape)");
+
+            // With the floor = max(resume, slot_tokens) = 100: anchor 90 loses, strict wins.
+            const auto m_floor = cache4.best_with_partial(64, prompt, {}, true, {90}, 100);
+            check(!m_floor.partial && m_floor.tokens == 64,
+                  "T16.9.3: anchor 90 vs floor 100 -> strict wins (resume=100, anchor=90)");
+
+            // Anchor 150 beats the floor 100 -> the partial wins and restores at 150.
+            const auto m_deep = cache4.best_with_partial(64, prompt, {}, true, {150}, 100);
+            check(m_deep.partial && m_deep.tokens == 200 && m_deep.checkpoint_length == 203,
+                  "T16.9.4: anchor 150 vs floor 100 -> partial wins (P=200, L=203)");
         }
     }
 

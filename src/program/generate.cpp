@@ -15771,7 +15771,8 @@ int main(int argc, char** argv) {
             // in the restored parked image and run the partial helper.  The session's
             // state-checkpoint lengths ride along (r2 F3): a partial mount is chosen only
             // when its deepest restorable anchor <= P across both pools beats the strict
-            // match's s, so the feature can never restore shallower than flag-off.
+            // match's s AND the session's own floor max(resume, slot_tokens) (r4 F2), so
+            // the feature can never restore shallower than flag-off.
             // The session-local live+checks search above stays strict-only (the
             // live/checks K/V arena is one branch of history; partial-mounting it requires
             // a warm-up of [0, P) to re-derive the GDN running state, which is a follow-up
@@ -15779,9 +15780,11 @@ int main(int argc, char** argv) {
             std::vector<int64_t> sfx_state_lengths;
             sfx_state_lengths.reserve(state_checks.size());
             for (const ConvCheckpoint& c : state_checks)
-                sfx_state_lengths.push_back((int64_t) c.ids.size());
+                if (starts_with(c.ids, c.imgs))   // r4 F1: same validity rule as the off_path erase below - a
+                    sfx_state_lengths.push_back((int64_t) c.ids.size());   // non-prefix entry is not a restorable anchor
             const auto parked = conversations.best_with_partial(
-                o.cache_suffix_reuse, ids, req_imgs, want_cvec, sfx_state_lengths);
+                o.cache_suffix_reuse, ids, req_imgs, want_cvec, sfx_state_lengths,
+                std::max(resume, slot_tokens));   // r4 F2: the anchor must beat the session's flag-off floor
             if (sfx_dbg())
                 std::fprintf(stderr, "[SFX-DBG] parked-search: flag=%lld entries=%zu match{tokens=%lld partial=%d ckpt_len=%lld live=%d} resume=%lld slot_tokens=%lld\n",
                              (long long) o.cache_suffix_reuse, conversations.size(),
